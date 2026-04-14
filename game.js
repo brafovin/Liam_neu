@@ -104,6 +104,7 @@ const game = {
     editing: null,    // struct being edited
     editGrid: [],     // 3x3 toggles for current edit
     editMeshes: [],
+    editDragValue: null, // 0 or 1 while drag-painting cells, null when idle
     waveTimer: 0,
     spawnQueue: 0,
     raycaster: new THREE.Raycaster(),
@@ -264,7 +265,10 @@ function setupInput() {
         if (e.button === 2) game.mouse.rightDown = true;
     });
     document.addEventListener('mouseup', (e) => {
-        if (e.button === 0) game.mouse.down = false;
+        if (e.button === 0) {
+            game.mouse.down = false;
+            game.editDragValue = null;
+        }
         if (e.button === 2) game.mouse.rightDown = false;
     });
     document.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -448,6 +452,7 @@ function loop() {
         updatePlayer(dt);
         updatePreview();
         updateAutoBuild(dt);
+        updateEditDrag();
         updateBullets(dt);
         updateParticles(dt);
         updateDamageNumbers(dt);
@@ -504,8 +509,33 @@ function slotType() {
 function snap(v) { return Math.round(v / GRID) * GRID; }
 
 function buildTargetPos(type) {
-    // Raycast from camera forward to find what the crosshair is pointing at.
-    const origin = game.player.pos.clone();
+    const p = game.player;
+    const feetY = p.pos.y - PLAYER_HEIGHT;
+    // Current "floor level" — the integer grid level the player is standing on.
+    const floorLevel = Math.floor((feetY + 0.1) / GRID);
+
+    // Player's facing direction snapped to nearest cardinal.
+    const cardYaw = Math.round(p.yaw / (Math.PI / 2)) * (Math.PI / 2);
+    const fwdX = -Math.sin(cardYaw);
+    const fwdZ = -Math.cos(cardYaw);
+
+    // Player's current cell (grid-aligned).
+    const pCellX = Math.round(p.pos.x / GRID) * GRID;
+    const pCellZ = Math.round(p.pos.z / GRID) * GRID;
+
+    // --- Ramps: Fortnite-style — cell one step ahead of player, base at feet. ---
+    // The ramp's "front" (low end) sits at the border of the player's current
+    // cell so stepping forward climbs onto the slope smoothly without teleport.
+    if (type === 'ramp') {
+        const rampCellX = pCellX + Math.round(fwdX) * GRID;
+        const rampCellZ = pCellZ + Math.round(fwdZ) * GRID;
+        // Local +X (climb direction) must map to player forward, so rotY = yaw + π/2
+        const rotY = Math.round((p.yaw + Math.PI / 2) / (Math.PI / 2)) * (Math.PI / 2);
+        return { x: rampCellX, y: floorLevel * GRID + GRID / 2, z: rampCellZ, rotY };
+    }
+
+    // For all other pieces, raycast to find the target cell the crosshair points at.
+    const origin = p.pos.clone();
     const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(game.camera.quaternion).normalize();
     game.raycaster.set(origin, dir);
     game.raycaster.far = 15;
@@ -516,32 +546,42 @@ function buildTargetPos(type) {
     for (const w of game.worldMeshes) targets.push(w);
     const hits = game.raycaster.intersectObjects(targets, true);
 
-    // Fallback when nothing hit: project 7m forward at head height
     let hp;
     if (hits.length) {
         hp = hits[0].point.clone();
-        // Nudge slightly along ray direction so we land "in" the surface (helps wall edge detection)
         hp.add(dir.clone().multiplyScalar(0.01));
     } else {
         hp = origin.clone().add(dir.clone().multiplyScalar(7));
     }
 
-    // Cell that the hit point falls into
     const cellX = Math.round(hp.x / GRID) * GRID;
     const cellZ = Math.round(hp.z / GRID) * GRID;
 
     if (type === 'floor') {
+        // Floor level comes from where the crosshair is pointing so you can
+        // stack floors by looking up at a wall's top, etc.
         const k = Math.round(hp.y / GRID);
         return { x: cellX, y: k * GRID - 0.125, z: cellZ, rotY: 0 };
     }
 
     if (type === 'wall') {
-        // Pick the nearest edge of the cell the user is looking at so walls snap
-        // exactly to grid lines like in Fortnite.
-        const k = Math.floor(hp.y / GRID);
-        const wy = k * GRID + GRID / 2;
-        const dx = hp.x - cellX;
-        const dz = hp.z - cellZ;
+        // Wall always lives at the PLAYER'S floor level (matches Fortnite —
+        // you can't accidentally place a wall one story above while looking up).
+        const wy = floorLevel * GRID + GRID / 2;
+        // Pick the edge of the target cell that's on the PLAYER'S side so the
+        // wall sits between the player and whatever they're looking at.
+        const dx = p.pos.x - cellX;
+        const dz = p.pos.z - cellZ;
+        if (Math.abs(dx) < 0.1 && Math.abs(dz) < 0.1) {
+            // Player is standing in the target cell → use facing direction.
+            if (Math.abs(fwdX) > Math.abs(fwdZ)) {
+                const sign = fwdX > 0 ? 1 : -1;
+                return { x: cellX + sign * GRID / 2, y: wy, z: cellZ, rotY: Math.PI / 2 };
+            } else {
+                const sign = fwdZ > 0 ? 1 : -1;
+                return { x: cellX, y: wy, z: cellZ + sign * GRID / 2, rotY: 0 };
+            }
+        }
         if (Math.abs(dx) >= Math.abs(dz)) {
             const sign = dx >= 0 ? 1 : -1;
             return { x: cellX + sign * GRID / 2, y: wy, z: cellZ, rotY: Math.PI / 2 };
@@ -549,16 +589,6 @@ function buildTargetPos(type) {
             const sign = dz >= 0 ? 1 : -1;
             return { x: cellX, y: wy, z: cellZ + sign * GRID / 2, rotY: 0 };
         }
-    }
-
-    if (type === 'ramp') {
-        const k = Math.floor(hp.y / GRID);
-        // The ramp's local +X axis climbs the slope. We want that to map to the
-        // player's forward direction in world, so walking forward goes UP the ramp.
-        // Math: world forward = (-sin y, 0, -cos y); three.js local +X → world
-        // (cos r, 0, -sin r). Equating gives r = yaw + π/2.
-        const rotY = Math.round((game.player.yaw + Math.PI / 2) / (Math.PI / 2)) * (Math.PI / 2);
-        return { x: cellX, y: k * GRID + GRID / 2, z: cellZ, rotY };
     }
 
     // roof
@@ -1854,18 +1884,42 @@ function clearEditOverlay() {
     document.getElementById('edit-hint').classList.add('hidden');
 }
 
-function editClick() {
-    // raycast against edit cells
+// Raycast against the 3x3 edit overlay and return the cell mesh under crosshair.
+function pickEditCell() {
     const origin = game.player.pos.clone();
     const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(game.camera.quaternion);
     game.raycaster.set(origin, dir);
     game.raycaster.far = 8;
     const hits = game.raycaster.intersectObjects(game.editMeshes, false);
-    if (!hits.length) return;
-    const cell = hits[0].object;
+    return hits.length ? hits[0].object : null;
+}
+
+function setEditCell(cell, value) {
     const { r, c } = cell.userData;
-    game.editGrid[r][c] = game.editGrid[r][c] ? 0 : 1;
-    cell.material = game.editGrid[r][c] ? EDIT_CELL_MAT_ON : EDIT_CELL_MAT_OFF;
+    if (game.editGrid[r][c] === value) return;
+    game.editGrid[r][c] = value;
+    cell.material = value ? EDIT_CELL_MAT_ON : EDIT_CELL_MAT_OFF;
+}
+
+// Fortnite-style drag-paint: clicking a cell records whether we're painting
+// "on" or "off", and while the mouse is held down every cell the crosshair
+// touches gets set to the same value. Releases stop the paint.
+function editClick() {
+    const cell = pickEditCell();
+    if (!cell) return;
+    const { r, c } = cell.userData;
+    const target = game.editGrid[r][c] ? 0 : 1;
+    game.editDragValue = target;
+    setEditCell(cell, target);
+}
+
+function updateEditDrag() {
+    if (game.mode !== 'edit') return;
+    if (!game.mouse.down) return;
+    if (game.editDragValue === null || game.editDragValue === undefined) return;
+    const cell = pickEditCell();
+    if (!cell) return;
+    setEditCell(cell, game.editDragValue);
 }
 
 function commitEdit() {
@@ -1908,6 +1962,7 @@ function commitEdit() {
     s.box = structureBox(s.type, s.x, s.y, s.z, s.rotY); // outer bounding for quick reject
     clearEditOverlay();
     game.editing = null;
+    game.editDragValue = null;
     game.mode = 'build';
     updateModeHud();
     updatePreview();
@@ -1917,6 +1972,7 @@ function cancelEdit() {
     clearEditOverlay();
     game.editing = null;
     game.editGrid = [];
+    game.editDragValue = null;
 }
 function updateSlotHud() {
     document.querySelectorAll('.slot').forEach(s => {
