@@ -112,6 +112,11 @@ const game = {
     groundMesh: null,
     sunLight: null,
     buildCooldown: 0, // auto-build rate limiter
+    state: 'lobby',   // 'lobby' | 'playing' | 'gameover'
+    startPad: null,
+    dummies: [],
+    viewmodelHolder: null,
+    viewmodelRecoil: 0,
 };
 
 // === 2. SCENE SETUP ==========================================
@@ -120,7 +125,11 @@ function setupScene() {
     game.scene.background = new THREE.Color(0x87ceeb);
     game.scene.fog = new THREE.Fog(0x87ceeb, 80, 300);
 
-    game.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 1000);
+    game.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 1000);
+    // Camera must be in the scene so the viewmodel (a child of the camera) renders.
+    game.scene.add(game.camera);
+    game.viewmodelHolder = new THREE.Group();
+    game.camera.add(game.viewmodelHolder);
 
     game.renderer = new THREE.WebGLRenderer({ antialias: true });
     game.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -281,6 +290,7 @@ function selectSlot(n) {
     updateSlotHud();
     updateModeHud();
     updatePreview();
+    updateViewmodel();
     updateHudCounters();
 }
 
@@ -436,9 +446,13 @@ function loop() {
         updateAutoBuild(dt);
         updateBullets(dt);
         updateParticles(dt);
-        updateEnemies(dt);
-        updateBossProjectiles(dt);
-        updateWaves(dt);
+        if (game.state === 'lobby') {
+            updateLobby(dt);
+        } else if (game.state === 'playing') {
+            updateEnemies(dt);
+            updateBossProjectiles(dt);
+            updateWaves(dt);
+        }
         updateWeapon(dt);
         updateDamageFlash(dt);
     }
@@ -656,9 +670,12 @@ function shoot() {
     p.shootCooldown = w.cd;
     if (ammo.clip === 0 && ammo.reserve > 0) startReload();
 
-    // Collect candidate targets once; reused per pellet.
+    // Collect candidate targets. Enemies are represented by their invisible
+    // HITBOX child mesh (bigger than the visual) so aiming is forgiving.
+    // Dummies use their main mesh (they need to be visible AND hittable).
     const targets = [];
-    for (const e of game.enemies) targets.push(e.mesh);
+    for (const e of game.enemies) if (e.hitbox) targets.push(e.hitbox);
+    for (const d of game.dummies) targets.push(d.hitbox);
     for (const b of game.builds) targets.push(b.mesh);
 
     const origin = p.pos.clone();
@@ -679,13 +696,19 @@ function shoot() {
         let endPoint;
         if (hits.length) {
             endPoint = hits[0].point.clone();
-            let owner = hits[0].object;
-            while (owner) {
-                const e = game.enemies.find(en => en.mesh === owner);
-                if (e) { damageEnemy(e, w.dmg); break; }
-                const bb = game.builds.find(bu => bu.mesh === owner);
-                if (bb) { damageBuild(bb, w.dmg); break; }
-                owner = owner.parent;
+            const obj = hits[0].object;
+            if (obj.userData && obj.userData.isHitbox && obj.userData.enemy) {
+                damageEnemy(obj.userData.enemy, w.dmg);
+            } else if (obj.userData && obj.userData.isDummy) {
+                damageDummy(obj.userData.dummy, w.dmg);
+            } else {
+                // Must be a build (or child of a build group)
+                let owner = obj;
+                while (owner) {
+                    const bb = game.builds.find(bu => bu.mesh === owner);
+                    if (bb) { damageBuild(bb, w.dmg); break; }
+                    owner = owner.parent;
+                }
             }
             spawnImpact(endPoint);
         } else {
@@ -694,6 +717,7 @@ function shoot() {
         spawnTracer(origin.clone().add(dir.clone().multiplyScalar(0.6)), endPoint, w.tracerColor);
     }
     spawnMuzzleFlash(origin, baseDir);
+    game.viewmodelRecoil = Math.min(0.15, game.viewmodelRecoil + 0.08);
     updateHudCounters();
 }
 
@@ -726,6 +750,16 @@ function updateWeapon(dt) {
     if (p.shootCooldown > 0) p.shootCooldown -= dt;
     if (p.healCd > 0) p.healCd -= dt;
 
+    // Viewmodel recoil: push backward along Z when firing, then ease back.
+    if (game.viewmodelHolder) {
+        game.viewmodelRecoil *= Math.max(0, 1 - dt * 12);
+        const vm = game.viewmodelHolder.children[0];
+        if (vm) {
+            vm.position.z = -0.45 + game.viewmodelRecoil;
+            vm.rotation.x = game.viewmodelRecoil * 1.2;
+        }
+    }
+
     if (p.reloading) {
         p.reloadTimer -= dt;
         if (p.reloadTimer <= 0) {
@@ -757,6 +791,164 @@ function spawnTracer(from, to, color = 0xffff66) {
     line.userData.life = 0.08;
     game.scene.add(line);
     game.bullets.push(line);
+}
+
+// === VIEWMODEL (first-person weapon held in hand) ============
+function makeWeaponViewmodel(id) {
+    const g = new THREE.Group();
+
+    if (id === 'pistol') {
+        const slide = new THREE.Mesh(
+            new THREE.BoxGeometry(0.08, 0.1, 0.28),
+            new THREE.MeshStandardMaterial({ color: 0x222222, metalness: 0.6, roughness: 0.4 })
+        );
+        slide.position.set(0, 0, -0.1);
+        g.add(slide);
+        const grip = new THREE.Mesh(
+            new THREE.BoxGeometry(0.07, 0.18, 0.1),
+            new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.8 })
+        );
+        grip.position.set(0, -0.12, 0.05);
+        g.add(grip);
+        const barrel = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.015, 0.015, 0.08, 8),
+            new THREE.MeshStandardMaterial({ color: 0x000000 })
+        );
+        barrel.rotation.x = Math.PI / 2;
+        barrel.position.set(0, 0.01, -0.28);
+        g.add(barrel);
+    }
+    else if (id === 'ak') {
+        const body = new THREE.Mesh(
+            new THREE.BoxGeometry(0.08, 0.1, 0.55),
+            new THREE.MeshStandardMaterial({ color: 0x3a2510, metalness: 0.2, roughness: 0.7 })
+        );
+        body.position.set(0, 0, -0.2);
+        g.add(body);
+        const stock = new THREE.Mesh(
+            new THREE.BoxGeometry(0.06, 0.11, 0.22),
+            new THREE.MeshStandardMaterial({ color: 0x4a321a })
+        );
+        stock.position.set(0, -0.01, 0.18);
+        g.add(stock);
+        const mag = new THREE.Mesh(
+            new THREE.BoxGeometry(0.06, 0.16, 0.09),
+            new THREE.MeshStandardMaterial({ color: 0x1a1a1a })
+        );
+        mag.position.set(0, -0.12, -0.1);
+        g.add(mag);
+        const barrel = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.018, 0.018, 0.2, 8),
+            new THREE.MeshStandardMaterial({ color: 0x111111, metalness: 0.7 })
+        );
+        barrel.rotation.x = Math.PI / 2;
+        barrel.position.set(0, 0.03, -0.55);
+        g.add(barrel);
+        const grip = new THREE.Mesh(
+            new THREE.BoxGeometry(0.05, 0.14, 0.05),
+            new THREE.MeshStandardMaterial({ color: 0x1a1a1a })
+        );
+        grip.position.set(0, -0.12, 0.05);
+        g.add(grip);
+    }
+    else if (id === 'shotgun') {
+        const stock = new THREE.Mesh(
+            new THREE.BoxGeometry(0.09, 0.13, 0.28),
+            new THREE.MeshStandardMaterial({ color: 0x5a3a15, roughness: 0.9 })
+        );
+        stock.position.set(0, -0.02, 0.18);
+        g.add(stock);
+        const receiver = new THREE.Mesh(
+            new THREE.BoxGeometry(0.09, 0.1, 0.22),
+            new THREE.MeshStandardMaterial({ color: 0x222222, metalness: 0.5 })
+        );
+        receiver.position.set(0, 0.0, -0.06);
+        g.add(receiver);
+        const barrel = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.034, 0.034, 0.55, 14),
+            new THREE.MeshStandardMaterial({ color: 0x111111, metalness: 0.7 })
+        );
+        barrel.rotation.x = Math.PI / 2;
+        barrel.position.set(0, 0.03, -0.44);
+        g.add(barrel);
+        const pump = new THREE.Mesh(
+            new THREE.BoxGeometry(0.08, 0.06, 0.14),
+            new THREE.MeshStandardMaterial({ color: 0x3a2510 })
+        );
+        pump.position.set(0, -0.06, -0.3);
+        g.add(pump);
+    }
+    else if (id === 'sniper') {
+        const stock = new THREE.Mesh(
+            new THREE.BoxGeometry(0.07, 0.1, 0.3),
+            new THREE.MeshStandardMaterial({ color: 0x2a1a0a })
+        );
+        stock.position.set(0, -0.04, 0.2);
+        g.add(stock);
+        const body = new THREE.Mesh(
+            new THREE.BoxGeometry(0.07, 0.08, 0.3),
+            new THREE.MeshStandardMaterial({ color: 0x1a1a1a, metalness: 0.5 })
+        );
+        body.position.set(0, 0, -0.08);
+        g.add(body);
+        const barrel = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.018, 0.018, 0.7, 10),
+            new THREE.MeshStandardMaterial({ color: 0x0a0a0a, metalness: 0.8 })
+        );
+        barrel.rotation.x = Math.PI / 2;
+        barrel.position.set(0, 0.02, -0.52);
+        g.add(barrel);
+        const scope = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.035, 0.035, 0.2, 12),
+            new THREE.MeshStandardMaterial({ color: 0x111111, metalness: 0.9 })
+        );
+        scope.rotation.x = Math.PI / 2;
+        scope.position.set(0, 0.07, -0.1);
+        g.add(scope);
+        const scopeLens = new THREE.Mesh(
+            new THREE.CircleGeometry(0.028, 12),
+            new THREE.MeshBasicMaterial({ color: 0x88ddff })
+        );
+        scopeLens.position.set(0, 0.07, -0.005);
+        g.add(scopeLens);
+    }
+    else if (id === 'medkit') {
+        const box = new THREE.Mesh(
+            new THREE.BoxGeometry(0.26, 0.2, 0.16),
+            new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6 })
+        );
+        g.add(box);
+        const cross1 = new THREE.Mesh(
+            new THREE.BoxGeometry(0.16, 0.05, 0.005),
+            new THREE.MeshBasicMaterial({ color: 0xdd0000 })
+        );
+        cross1.position.set(0, 0, 0.085);
+        g.add(cross1);
+        const cross2 = new THREE.Mesh(
+            new THREE.BoxGeometry(0.05, 0.16, 0.005),
+            new THREE.MeshBasicMaterial({ color: 0xdd0000 })
+        );
+        cross2.position.set(0, 0, 0.085);
+        g.add(cross2);
+    }
+
+    // Anchor the viewmodel at the lower-right of the screen, slightly in front.
+    g.position.set(0.24, -0.22, -0.45);
+    g.rotation.y = -0.08;
+    // Viewmodels shouldn't cast shadows (they're at the camera origin).
+    g.traverse(o => { if (o.isMesh) { o.castShadow = false; o.receiveShadow = false; } });
+    return g;
+}
+
+function updateViewmodel() {
+    if (!game.viewmodelHolder) return;
+    while (game.viewmodelHolder.children.length > 0) {
+        game.viewmodelHolder.remove(game.viewmodelHolder.children[0]);
+    }
+    let id = null;
+    if (game.mode === 'combat') id = game.player.currentWeapon;
+    else if (game.mode === 'heal') id = 'medkit';
+    if (id) game.viewmodelHolder.add(makeWeaponViewmodel(id));
 }
 
 function useMedkit() {
@@ -845,11 +1037,27 @@ const BOSS_RADIUS = 1.3;
 const BOSS_ATTACK_RANGE = 2.5;
 const BOSS_ATTACK_CD = 1.4;
 
-function spawnEnemy() {
-    const angle = Math.random() * Math.PI * 2;
-    const dist = 35 + Math.random() * 15;
-    const x = Math.cos(angle) * dist;
-    const z = Math.sin(angle) * dist;
+// Generous hitbox — bigger than the visual mesh so aiming is more forgiving.
+// Uses an invisible material so shots still raycast-hit it but it doesn't render.
+function makeHitbox(width, height, depth, enemyRef) {
+    const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(width, height, depth),
+        new THREE.MeshBasicMaterial({ visible: false })
+    );
+    mesh.userData.isHitbox = true;
+    mesh.userData.enemy = enemyRef;
+    return mesh;
+}
+
+function spawnEnemy(overridePos) {
+    let x, z;
+    if (overridePos) { x = overridePos.x; z = overridePos.z; }
+    else {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = 35 + Math.random() * 15;
+        x = Math.cos(angle) * dist;
+        z = Math.sin(angle) * dist;
+    }
     const mesh = new THREE.Mesh(ENEMY_GEO, ENEMY_MAT.clone());
     mesh.position.set(x, 0.9, z);
     mesh.castShadow = true;
@@ -872,6 +1080,7 @@ function spawnEnemy() {
     const e = {
         isBoss: false,
         mesh, bar, barBg,
+        hitbox: null,
         pos: mesh.position,
         meshYOffset: 0.9,
         hp: hpMax, hpMax,
@@ -885,7 +1094,13 @@ function spawnEnemy() {
         mat: ENEMY_MAT, matHurt: ENEMY_MAT_HURT,
         shootCd: 0,
     };
+    // Hitbox ~60% wider and 30% taller than the visual box, centered on the body.
+    const hb = makeHitbox(1.5, 2.4, 1.5, e);
+    hb.position.set(0, 0.3, 0); // shift up slightly so head is inside
+    mesh.add(hb);
+    e.hitbox = hb;
     game.enemies.push(e);
+    return e;
 }
 
 function spawnBoss() {
@@ -927,6 +1142,7 @@ function spawnBoss() {
     const e = {
         isBoss: true,
         mesh, bar, barBg,
+        hitbox: null,
         pos: mesh.position,
         meshYOffset: 1.8,
         hp: hpMax, hpMax,
@@ -940,6 +1156,11 @@ function spawnBoss() {
         mat: BOSS_MAT, matHurt: BOSS_MAT_HURT,
         shootCd: 2.2,
     };
+    // Generous boss hitbox: matches visual closely but slightly padded.
+    const hb = makeHitbox(3.2, 4.2, 3.2, e);
+    hb.position.set(0, 0, 0);
+    mesh.add(hb);
+    e.hitbox = hb;
     game.enemies.push(e);
     showMessage('BOSS ERSCHEINT!', 2500);
 }
@@ -1176,6 +1397,172 @@ function startWaves() {
     game.bossQueue = 0;
     game.waveTimer = 1.0;
     showMessage('Welle 1', 1500);
+}
+
+// === LOBBY =========================================================
+const START_PAD_POS = new THREE.Vector3(0, 0.05, -30);
+const START_PAD_RADIUS = 2.5;
+const DUMMY_POSITIONS = [
+    { x: -3, z: -8 },
+    { x:  3, z: -8 },
+    { x: -5, z: -15 },
+    { x:  5, z: -15 },
+    { x:  0, z: -22 },
+];
+const DUMMY_GEO  = new THREE.BoxGeometry(0.9, 1.8, 0.9);
+const DUMMY_MAT  = new THREE.MeshStandardMaterial({ color: 0xaaaaaa });
+const DUMMY_HURT = new THREE.MeshStandardMaterial({ color: 0xffdddd });
+const DUMMY_HP   = 60;
+const DUMMY_RESPAWN = 2.0;
+
+function spawnDummy(x, z) {
+    const mesh = new THREE.Mesh(DUMMY_GEO, DUMMY_MAT.clone());
+    mesh.position.set(x, 0.9, z);
+    mesh.castShadow = true;
+    // Wooden pole under the dummy to look like a practice target
+    const pole = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.08, 0.08, 1.8, 8),
+        new THREE.MeshStandardMaterial({ color: 0x6b4422 })
+    );
+    pole.position.set(0, -0.9, 0);
+    mesh.add(pole);
+    // HP bar
+    const barBg = new THREE.Mesh(
+        new THREE.PlaneGeometry(1.0, 0.1),
+        new THREE.MeshBasicMaterial({ color: 0x222222, depthTest: false })
+    );
+    barBg.position.set(0, 1.3, 0);
+    barBg.renderOrder = 10;
+    mesh.add(barBg);
+    const bar = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.96, 0.07),
+        new THREE.MeshBasicMaterial({ color: 0xffcc00, depthTest: false })
+    );
+    bar.position.set(0, 1.3, 0.01);
+    bar.renderOrder = 11;
+    mesh.add(bar);
+
+    const d = { mesh, bar, barBg, hp: DUMMY_HP, hurtTimer: 0, respawnTimer: 0, dead: false, homeX: x, homeZ: z };
+    // Generous hitbox for easy target practice
+    const hb = makeHitbox(1.6, 2.4, 1.6, null);
+    hb.userData.isHitbox = false;
+    hb.userData.isDummy = true;
+    hb.userData.dummy = d;
+    hb.position.set(0, 0.3, 0);
+    mesh.add(hb);
+    d.hitbox = hb;
+    game.scene.add(mesh);
+    game.dummies.push(d);
+    return d;
+}
+
+function damageDummy(d, dmg) {
+    if (d.dead) return;
+    d.hp -= dmg;
+    d.hurtTimer = 0.1;
+    if (d.hp <= 0) {
+        d.dead = true;
+        d.mesh.visible = false;
+        d.respawnTimer = DUMMY_RESPAWN;
+    }
+}
+
+function updateDummies(dt) {
+    for (const d of game.dummies) {
+        if (d.dead) {
+            d.respawnTimer -= dt;
+            if (d.respawnTimer <= 0) {
+                d.hp = DUMMY_HP;
+                d.dead = false;
+                d.mesh.visible = true;
+                d.bar.scale.x = 1;
+                d.bar.position.x = 0;
+            }
+            continue;
+        }
+        if (d.hurtTimer > 0) {
+            d.hurtTimer -= dt;
+            d.mesh.material = DUMMY_HURT;
+            if (d.hurtTimer <= 0) d.mesh.material = DUMMY_MAT;
+        }
+        d.bar.lookAt(game.camera.position);
+        d.barBg.lookAt(game.camera.position);
+        const pct = Math.max(0, d.hp / DUMMY_HP);
+        d.bar.scale.x = pct;
+        d.bar.position.x = -(1 - pct) * 0.48;
+    }
+}
+
+function createStartPad() {
+    // Glowing green pad with a ring
+    const pad = new THREE.Mesh(
+        new THREE.CylinderGeometry(START_PAD_RADIUS, START_PAD_RADIUS, 0.1, 32),
+        new THREE.MeshStandardMaterial({
+            color: 0x00ff55, emissive: 0x00aa33, emissiveIntensity: 0.8,
+        })
+    );
+    pad.position.copy(START_PAD_POS);
+    pad.receiveShadow = true;
+    game.scene.add(pad);
+    // Animated outer ring
+    const ring = new THREE.Mesh(
+        new THREE.TorusGeometry(START_PAD_RADIUS + 0.2, 0.15, 8, 32),
+        new THREE.MeshStandardMaterial({ color: 0xaaff88, emissive: 0x55ff33, emissiveIntensity: 1 })
+    );
+    ring.rotation.x = Math.PI / 2;
+    ring.position.copy(START_PAD_POS).setY(0.3);
+    game.scene.add(ring);
+    // Beacon of light
+    const beacon = new THREE.PointLight(0x88ff44, 1.5, 20);
+    beacon.position.copy(START_PAD_POS).setY(2);
+    game.scene.add(beacon);
+    game.startPad = { pad, ring, beacon };
+}
+
+function buildLobby() {
+    createStartPad();
+    for (const p of DUMMY_POSITIONS) spawnDummy(p.x, p.z);
+}
+
+function clearLobby() {
+    for (const d of game.dummies) game.scene.remove(d.mesh);
+    game.dummies = [];
+    if (game.startPad) {
+        game.scene.remove(game.startPad.pad);
+        game.scene.remove(game.startPad.ring);
+        game.scene.remove(game.startPad.beacon);
+        game.startPad = null;
+    }
+}
+
+function updateLobby(dt) {
+    // Animate ring
+    if (game.startPad) {
+        game.startPad.ring.rotation.z += dt * 1.5;
+        game.startPad.ring.position.y = 0.3 + Math.sin(performance.now() * 0.004) * 0.15;
+    }
+    updateDummies(dt);
+    // Check if player stepped onto the pad
+    const dx = game.player.pos.x - START_PAD_POS.x;
+    const dz = game.player.pos.z - START_PAD_POS.z;
+    if (dx * dx + dz * dz < START_PAD_RADIUS * START_PAD_RADIUS) {
+        enterPlayingState();
+    }
+}
+
+function enterPlayingState() {
+    if (game.state !== 'lobby') return;
+    game.state = 'playing';
+    clearLobby();
+    const hint = document.getElementById('lobby-hint');
+    if (hint) hint.classList.add('hidden');
+    startWaves();
+    showMessage('VIEL GLÜCK!', 1500);
+}
+
+function showLobbyHint() {
+    const hint = document.getElementById('lobby-hint');
+    if (hint) hint.classList.remove('hidden');
 }
 function updateDamageFlash(dt) {
     if (game.player.damageFlashTimer > 0) {
@@ -1457,8 +1844,14 @@ function restart() {
     game.mouse.down = false;
     game.mouse.rightDown = false;
     if (game.editing) cancelEdit();
+    // Tear down any remaining lobby props and jump straight into action.
+    clearLobby();
+    const hint = document.getElementById('lobby-hint');
+    if (hint) hint.classList.add('hidden');
+    game.state = 'playing';
     updateSlotHud();
     updateModeHud();
+    updateViewmodel();
     updateHudCounters();
     document.getElementById('game-over').classList.add('hidden');
     document.body.classList.remove('damage');
@@ -1475,8 +1868,12 @@ function init() {
     setupInput();
     game.clock = new THREE.Clock();
     game.running = true;
+    game.state = 'lobby';
+    buildLobby();
+    showLobbyHint();
     updateSlotHud();
     updateModeHud();
+    updateViewmodel();
     updateHudCounters();
 
     document.getElementById('restart-btn').addEventListener('click', restart);
@@ -1491,7 +1888,6 @@ function init() {
         showMessage('Browser unterstützt Pointer Lock nicht', 4000);
     }
 
-    startWaves();
     loop();
 }
 

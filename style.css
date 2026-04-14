@@ -306,6 +306,21 @@ canvas {
     font-size: 14px;
 }
 
+#lobby-hint {
+    position: absolute;
+    top: 120px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 160, 60, 0.85);
+    padding: 10px 22px;
+    border-radius: 6px;
+    font-size: 15px;
+    border: 1px solid #88ff88;
+    box-shadow: 0 0 20px rgba(0, 255, 80, 0.4);
+    text-align: center;
+    max-width: 640px;
+}
+
 #message {
     position: absolute;
     top: 40%;
