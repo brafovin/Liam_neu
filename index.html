@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fortnite Clone - Bauen, Editieren, Schießen</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="blocker">
+        <div id="instructions">
+            <h1>FORTNITE CLONE</h1>
+            <p class="big">Klicke zum Starten</p>
+            <div class="controls">
+                <h2>Steuerung</h2>
+                <div class="control-grid">
+                    <div><b>WASD</b></div><div>Bewegen</div>
+                    <div><b>Maus</b></div><div>Umsehen</div>
+                    <div><b>Leertaste</b></div><div>Springen</div>
+                    <div><b>Shift</b></div><div>Sprinten</div>
+                    <div><b>Linksklick</b></div><div>Schießen / Bauen</div>
+                    <div><b>Rechtsklick</b></div><div>Zielen</div>
+                    <div><b>1</b></div><div>Waffe (Pistole)</div>
+                    <div><b>2</b></div><div>Wand bauen</div>
+                    <div><b>3</b></div><div>Boden bauen</div>
+                    <div><b>4</b></div><div>Rampe bauen</div>
+                    <div><b>5</b></div><div>Dach bauen</div>
+                    <div><b>G</b></div><div>Editier-Modus</div>
+                    <div><b>R</b></div><div>Nachladen</div>
+                    <div><b>ESC</b></div><div>Pause</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="hud">
+        <div id="crosshair">+</div>
+
+        <div id="top-info">
+            <div id="score">Kills: 0</div>
+            <div id="wave">Welle: 1</div>
+            <div id="enemies-left">Gegner: 0</div>
+        </div>
+
+        <div id="bottom-bar">
+            <div id="health-container">
+                <div class="bar-label">HP</div>
+                <div class="bar"><div id="health-bar" class="bar-fill health"></div></div>
+                <div id="health-text">100</div>
+            </div>
+            <div id="shield-container">
+                <div class="bar-label">SHIELD</div>
+                <div class="bar"><div id="shield-bar" class="bar-fill shield"></div></div>
+                <div id="shield-text">50</div>
+            </div>
+        </div>
+
+        <div id="inventory">
+            <div class="slot" data-slot="1">
+                <div class="slot-num">1</div>
+                <div class="slot-icon">🔫</div>
+                <div class="slot-name">Pistole</div>
+            </div>
+            <div class="slot" data-slot="2">
+                <div class="slot-num">2</div>
+                <div class="slot-icon">🧱</div>
+                <div class="slot-name">Wand</div>
+            </div>
+            <div class="slot" data-slot="3">
+                <div class="slot-num">3</div>
+                <div class="slot-icon">⬜</div>
+                <div class="slot-name">Boden</div>
+            </div>
+            <div class="slot" data-slot="4">
+                <div class="slot-num">4</div>
+                <div class="slot-icon">📐</div>
+                <div class="slot-name">Rampe</div>
+            </div>
+            <div class="slot" data-slot="5">
+                <div class="slot-num">5</div>
+                <div class="slot-icon">🔺</div>
+                <div class="slot-name">Dach</div>
+            </div>
+        </div>
+
+        <div id="ammo-container">
+            <div id="ammo-icon">🔫</div>
+            <div id="ammo-text">15 / 60</div>
+        </div>
+
+        <div id="materials">
+            <div class="material">
+                <span class="mat-icon">🪵</span>
+                <span id="wood-count">500</span>
+            </div>
+        </div>
+
+        <div id="mode-indicator">KAMPF</div>
+
+        <div id="edit-hint" class="hidden">EDIT-MODUS: Klicke auf Felder, dann bestätigen mit [G]</div>
+
+        <div id="message" class="hidden"></div>
+    </div>
+
+    <div id="game-over" class="hidden">
+        <h1>GAME OVER</h1>
+        <p id="final-score">Kills: 0 | Welle: 1</p>
+        <button id="restart-btn">Neustart</button>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="game.js"></script>
+</body>
+</html>

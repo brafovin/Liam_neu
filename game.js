@@ -1,0 +1,1061 @@
+// =============================================================
+// FORTNITE CLONE - Browser Game
+// Bauen, Editieren, Schießen in Three.js
+// =============================================================
+
+// === 1. GLOBALS ===============================================
+const GRID = 4;              // Build grid size (meters)
+const PLAYER_HEIGHT = 1.8;
+const PLAYER_RADIUS = 0.4;
+const GRAVITY = 30;
+const JUMP_V = 9.5;
+const MOVE_SPEED = 6;
+const SPRINT_MUL = 1.7;
+const MAX_HP = 100;
+const MAX_SHIELD = 50;
+const MAX_AMMO_CLIP = 15;
+const MAX_AMMO_RESERVE = 60;
+const BUILD_HP = 200;
+const BUILD_COST = 10;
+const ENEMY_HP_BASE = 40;
+const ENEMY_DMG = 8;
+const ENEMY_SPEED = 2.8;
+
+const game = {
+    scene: null, camera: null, renderer: null, clock: null,
+    player: {
+        pos: new THREE.Vector3(0, PLAYER_HEIGHT, 0),
+        vel: new THREE.Vector3(),
+        yaw: 0, pitch: 0,
+        onGround: false,
+        hp: MAX_HP, shield: MAX_SHIELD,
+        wood: 500, kills: 0, wave: 1,
+        ammoClip: MAX_AMMO_CLIP, ammoReserve: MAX_AMMO_RESERVE,
+        reloading: false, reloadTimer: 0,
+        shootCooldown: 0,
+        damageFlashTimer: 0,
+    },
+    keys: {},
+    mouse: { down: false, rightDown: false },
+    locked: false,
+    paused: true,
+    running: false,
+    slot: 1, // 1=gun, 2=wall, 3=floor, 4=ramp, 5=roof
+    mode: 'combat', // 'combat' | 'build' | 'edit'
+    builds: [],       // placed structures
+    enemies: [],
+    bullets: [],      // visual tracers
+    particles: [],
+    preview: null,    // ghost preview mesh
+    editing: null,    // struct being edited
+    editGrid: [],     // 3x3 toggles for current edit
+    editMeshes: [],
+    waveTimer: 0,
+    spawnQueue: 0,
+    raycaster: new THREE.Raycaster(),
+    tmpV: new THREE.Vector3(),
+    tmpV2: new THREE.Vector3(),
+    tmpE: new THREE.Euler(0, 0, 0, 'YXZ'),
+    worldBoxes: [],   // AABBs for collision (rebuilt when builds change)
+    sunLight: null,
+};
+
+// === 2. SCENE SETUP ==========================================
+function setupScene() {
+    game.scene = new THREE.Scene();
+    game.scene.background = new THREE.Color(0x87ceeb);
+    game.scene.fog = new THREE.Fog(0x87ceeb, 80, 300);
+
+    game.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 1000);
+
+    game.renderer = new THREE.WebGLRenderer({ antialias: true });
+    game.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    game.renderer.setSize(innerWidth, innerHeight);
+    game.renderer.shadowMap.enabled = true;
+    game.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(game.renderer.domElement);
+
+    // Lights
+    const amb = new THREE.AmbientLight(0xffffff, 0.55);
+    game.scene.add(amb);
+
+    const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+    sun.position.set(60, 100, 40);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.camera.near = 1;
+    sun.shadow.camera.far = 300;
+    sun.shadow.camera.left = -80;
+    sun.shadow.camera.right = 80;
+    sun.shadow.camera.top = 80;
+    sun.shadow.camera.bottom = -80;
+    game.scene.add(sun);
+    game.sunLight = sun;
+
+    // Ground
+    const groundGeo = new THREE.PlaneGeometry(400, 400, 1, 1);
+    const groundMat = new THREE.MeshStandardMaterial({ color: 0x4a8a3a });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    game.scene.add(ground);
+
+    // Grid helper (subtle)
+    const grid = new THREE.GridHelper(400, 100, 0x000000, 0x225522);
+    grid.material.opacity = 0.25;
+    grid.material.transparent = true;
+    game.scene.add(grid);
+
+    // Some decorative "trees" and rocks for scenery + cover
+    for (let i = 0; i < 30; i++) {
+        const x = (Math.random() - 0.5) * 300;
+        const z = (Math.random() - 0.5) * 300;
+        if (Math.abs(x) < 15 && Math.abs(z) < 15) continue;
+        if (Math.random() < 0.5) {
+            // tree
+            const trunk = new THREE.Mesh(
+                new THREE.CylinderGeometry(0.3, 0.4, 3, 8),
+                new THREE.MeshStandardMaterial({ color: 0x5a3a1a })
+            );
+            trunk.position.set(x, 1.5, z);
+            trunk.castShadow = true;
+            game.scene.add(trunk);
+            const leaves = new THREE.Mesh(
+                new THREE.ConeGeometry(2, 4, 8),
+                new THREE.MeshStandardMaterial({ color: 0x2a6a1a })
+            );
+            leaves.position.set(x, 5, z);
+            leaves.castShadow = true;
+            game.scene.add(leaves);
+            game.worldBoxes.push(new THREE.Box3().setFromObject(trunk));
+        } else {
+            // rock
+            const r = 0.6 + Math.random() * 1.2;
+            const rock = new THREE.Mesh(
+                new THREE.DodecahedronGeometry(r, 0),
+                new THREE.MeshStandardMaterial({ color: 0x888888 })
+            );
+            rock.position.set(x, r * 0.6, z);
+            rock.castShadow = true;
+            rock.receiveShadow = true;
+            game.scene.add(rock);
+            game.worldBoxes.push(new THREE.Box3().setFromObject(rock));
+        }
+    }
+}
+
+// === 3. INPUT / POINTER LOCK =================================
+function setupInput() {
+    const blocker = document.getElementById('blocker');
+    const canvas = game.renderer.domElement;
+
+    blocker.addEventListener('click', () => {
+        if (!game.running) return;
+        canvas.requestPointerLock();
+    });
+
+    document.addEventListener('pointerlockchange', () => {
+        game.locked = document.pointerLockElement === canvas;
+        game.paused = !game.locked;
+        blocker.classList.toggle('hidden', game.locked);
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!game.locked) return;
+        game.player.yaw -= e.movementX * 0.0022;
+        game.player.pitch -= e.movementY * 0.0022;
+        const lim = Math.PI / 2 - 0.02;
+        if (game.player.pitch > lim) game.player.pitch = lim;
+        if (game.player.pitch < -lim) game.player.pitch = -lim;
+    });
+
+    document.addEventListener('keydown', (e) => {
+        game.keys[e.code] = true;
+        if (!game.locked) return;
+        if (e.code === 'Digit1') selectSlot(1);
+        else if (e.code === 'Digit2') selectSlot(2);
+        else if (e.code === 'Digit3') selectSlot(3);
+        else if (e.code === 'Digit4') selectSlot(4);
+        else if (e.code === 'Digit5') selectSlot(5);
+        else if (e.code === 'KeyR') startReload();
+        else if (e.code === 'KeyG') toggleEditMode();
+    });
+    document.addEventListener('keyup', (e) => { game.keys[e.code] = false; });
+
+    document.addEventListener('mousedown', (e) => {
+        if (!game.locked) return;
+        if (e.button === 0) { game.mouse.down = true; handleClick(); }
+        if (e.button === 2) game.mouse.rightDown = true;
+    });
+    document.addEventListener('mouseup', (e) => {
+        if (e.button === 0) game.mouse.down = false;
+        if (e.button === 2) game.mouse.rightDown = false;
+    });
+    document.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    window.addEventListener('resize', () => {
+        game.camera.aspect = innerWidth / innerHeight;
+        game.camera.updateProjectionMatrix();
+        game.renderer.setSize(innerWidth, innerHeight);
+    });
+}
+
+function selectSlot(n) {
+    game.slot = n;
+    game.mode = (n === 1) ? 'combat' : 'build';
+    if (game.editing) cancelEdit();
+    updateSlotHud();
+    updateModeHud();
+    updatePreview();
+}
+
+// === 4. COLLISION ============================================
+function playerAABB(pos) {
+    return new THREE.Box3(
+        new THREE.Vector3(pos.x - PLAYER_RADIUS, pos.y - PLAYER_HEIGHT, pos.z - PLAYER_RADIUS),
+        new THREE.Vector3(pos.x + PLAYER_RADIUS, pos.y + 0.2, pos.z + PLAYER_RADIUS)
+    );
+}
+function collidesAt(pos) {
+    const box = playerAABB(pos);
+    for (const b of game.builds) {
+        if (!b.box.intersectsBox(box)) continue;
+        // If this build has per-tile boxes (after an edit), only block if at least one tile overlaps.
+        if (b.tileBoxes && b.tileBoxes.length) {
+            let hit = false;
+            for (const tb of b.tileBoxes) if (tb.intersectsBox(box)) { hit = true; break; }
+            if (hit) return true;
+        } else {
+            return true;
+        }
+    }
+    for (const wb of game.worldBoxes) {
+        if (wb.intersectsBox(box)) return true;
+    }
+    return false;
+}
+
+// === 5. PLAYER UPDATE ========================================
+function updatePlayer(dt) {
+    const p = game.player;
+
+    // desired horizontal velocity
+    const forward = new THREE.Vector3(-Math.sin(p.yaw), 0, -Math.cos(p.yaw));
+    const right = new THREE.Vector3(Math.cos(p.yaw), 0, -Math.sin(p.yaw));
+    let mx = 0, mz = 0;
+    if (game.keys['KeyW']) mz += 1;
+    if (game.keys['KeyS']) mz -= 1;
+    if (game.keys['KeyD']) mx += 1;
+    if (game.keys['KeyA']) mx -= 1;
+    const dir = new THREE.Vector3().addScaledVector(forward, mz).addScaledVector(right, mx);
+    if (dir.lengthSq() > 0) dir.normalize();
+    const speed = MOVE_SPEED * (game.keys['ShiftLeft'] || game.keys['ShiftRight'] ? SPRINT_MUL : 1);
+    p.vel.x = dir.x * speed;
+    p.vel.z = dir.z * speed;
+
+    // gravity & jump
+    p.vel.y -= GRAVITY * dt;
+    if (p.onGround && game.keys['Space']) { p.vel.y = JUMP_V; p.onGround = false; }
+
+    // axis-separated move + collide
+    const next = p.pos.clone();
+    next.x += p.vel.x * dt;
+    if (collidesAt(next)) { next.x = p.pos.x; p.vel.x = 0; }
+    next.z += p.vel.z * dt;
+    if (collidesAt(next)) { next.z = p.pos.z; p.vel.z = 0; }
+    next.y += p.vel.y * dt;
+    if (next.y < PLAYER_HEIGHT) { next.y = PLAYER_HEIGHT; p.vel.y = 0; p.onGround = true; }
+    else p.onGround = false;
+    if (collidesAt(next)) {
+        // hit ceiling or standing on build
+        if (p.vel.y > 0) { next.y = p.pos.y; p.vel.y = 0; }
+        else { next.y = p.pos.y; p.vel.y = 0; p.onGround = true; }
+    }
+    p.pos.copy(next);
+
+    // camera
+    game.camera.position.copy(p.pos);
+    game.tmpE.set(p.pitch, p.yaw, 0);
+    game.camera.quaternion.setFromEuler(game.tmpE);
+}
+
+// === 6. MAIN LOOP ============================================
+function loop() {
+    requestAnimationFrame(loop);
+    const dt = Math.min(game.clock.getDelta(), 0.05); // cap for tab switch
+    if (!game.paused && game.running) {
+        updatePlayer(dt);
+        updatePreview();
+        updateBullets(dt);
+        updateParticles(dt);
+        updateEnemies(dt);
+        updateWaves(dt);
+        updateWeapon(dt);
+        updateDamageFlash(dt);
+    }
+    game.renderer.render(game.scene, game.camera);
+}
+
+// === 7. BUILD SYSTEM ========================================
+const BUILD_MAT_WALL  = new THREE.MeshStandardMaterial({ color: 0xc9a26b });
+const BUILD_MAT_FLOOR = new THREE.MeshStandardMaterial({ color: 0xb08d55 });
+const BUILD_MAT_RAMP  = new THREE.MeshStandardMaterial({ color: 0xa67a45 });
+const BUILD_MAT_ROOF  = new THREE.MeshStandardMaterial({ color: 0x8f6a3a });
+const PREVIEW_MAT_OK  = new THREE.MeshBasicMaterial({ color: 0x00ff66, transparent: true, opacity: 0.35 });
+const PREVIEW_MAT_BAD = new THREE.MeshBasicMaterial({ color: 0xff3344, transparent: true, opacity: 0.35 });
+
+function makeBuildMesh(type, damaged) {
+    let mesh;
+    if (type === 'wall') {
+        mesh = new THREE.Mesh(new THREE.BoxGeometry(GRID, GRID, 0.25), BUILD_MAT_WALL);
+    } else if (type === 'floor') {
+        mesh = new THREE.Mesh(new THREE.BoxGeometry(GRID, 0.25, GRID), BUILD_MAT_FLOOR);
+    } else if (type === 'ramp') {
+        // Triangular prism centered at origin: base at y=-GRID/2, peak at y=GRID/2
+        const shape = new THREE.Shape();
+        shape.moveTo(-GRID / 2, -GRID / 2);
+        shape.lineTo(GRID / 2, -GRID / 2);
+        shape.lineTo(GRID / 2,  GRID / 2);
+        shape.lineTo(-GRID / 2, -GRID / 2);
+        const geo = new THREE.ExtrudeGeometry(shape, { depth: GRID, bevelEnabled: false });
+        geo.translate(0, 0, -GRID / 2); // center in Z
+        mesh = new THREE.Mesh(geo, BUILD_MAT_RAMP);
+    } else if (type === 'roof') {
+        // pyramid-ish thin top
+        mesh = new THREE.Mesh(new THREE.BoxGeometry(GRID, 0.5, GRID), BUILD_MAT_ROOF);
+    }
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    return mesh;
+}
+
+function slotType() {
+    return ['wall','floor','ramp','roof'][game.slot - 2] || 'wall';
+}
+
+function snap(v) { return Math.round(v / GRID) * GRID; }
+
+function buildTargetPos(type) {
+    // Cast from camera forward to get a point within 5m
+    const p = game.player.pos;
+    const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(game.camera.quaternion);
+    const target = p.clone().add(fwd.multiplyScalar(5));
+    const gx = snap(target.x);
+    const gz = snap(target.z);
+
+    // Y snapping
+    let gy;
+    if (type === 'floor') {
+        // Floor tiles live at integer grid levels (top-of-floor at k*GRID)
+        const k = Math.round(target.y / GRID);
+        gy = k * GRID - 0.125; // small thickness
+    } else if (type === 'wall') {
+        // Wall spans [k*GRID, k*GRID + GRID] — center at k*GRID + GRID/2
+        const k = Math.floor(target.y / GRID);
+        gy = k * GRID + GRID / 2;
+    } else if (type === 'ramp') {
+        // Ramp spans [k*GRID, k*GRID+GRID] so the mesh center is k*GRID + GRID/2
+        const k = Math.floor(target.y / GRID);
+        gy = k * GRID + GRID / 2;
+    } else /* roof */ {
+        const k = Math.round(target.y / GRID) + 1;
+        gy = k * GRID - 0.25;
+    }
+
+    // Wall / ramp face nearest cardinal yaw
+    let rotY = Math.round(game.player.yaw / (Math.PI / 2)) * (Math.PI / 2);
+    return { x: gx, y: gy, z: gz, rotY };
+}
+
+function structureBox(type, x, y, z, rotY) {
+    // Slight shrink so adjacent grid-aligned pieces don't register as overlapping.
+    const EPS = 0.02;
+    let hx, hy, hz;
+    if (type === 'wall')       { hx = GRID/2 - EPS; hy = GRID/2 - EPS; hz = 0.13; }
+    else if (type === 'floor') { hx = GRID/2 - EPS; hy = 0.13;          hz = GRID/2 - EPS; }
+    else if (type === 'ramp')  { hx = GRID/2 - EPS; hy = GRID/2 - EPS;  hz = GRID/2 - EPS; }
+    else                        { hx = GRID/2 - EPS; hy = 0.25;          hz = GRID/2 - EPS; }
+    // rotate half-extents for wall (depth axis swap)
+    if (type === 'wall' && Math.abs(Math.sin(rotY)) > 0.5) { const t = hx; hx = hz; hz = t; }
+    return new THREE.Box3(
+        new THREE.Vector3(x - hx, y - hy, z - hz),
+        new THREE.Vector3(x + hx, y + hy, z + hz)
+    );
+}
+
+function canPlace(type, x, y, z, rotY) {
+    const box = structureBox(type, x, y, z, rotY);
+    // not inside player
+    if (box.intersectsBox(playerAABB(game.player.pos))) return false;
+    // not overlapping existing builds
+    for (const b of game.builds) if (b.box.intersectsBox(box)) return false;
+    // not inside world obstacles (light check)
+    for (const wb of game.worldBoxes) if (wb.intersectsBox(box)) return false;
+    // not below ground
+    if (y < 0) return false;
+    return true;
+}
+
+function updatePreview() {
+    // hide preview when not in build mode
+    if (game.mode !== 'build') {
+        if (game.preview) { game.preview.visible = false; }
+        return;
+    }
+    const type = slotType();
+    if (!game.preview || game.preview.userData.type !== type) {
+        if (game.preview) game.scene.remove(game.preview);
+        game.preview = makeBuildMesh(type);
+        game.preview.material = PREVIEW_MAT_OK;
+        game.preview.userData.type = type;
+        game.preview.castShadow = false;
+        game.preview.receiveShadow = false;
+        game.scene.add(game.preview);
+    }
+    game.preview.visible = true;
+    const t = buildTargetPos(type);
+    game.preview.position.set(t.x, t.y, t.z);
+    game.preview.rotation.y = t.rotY;
+    const ok = canPlace(type, t.x, t.y, t.z, t.rotY) && game.player.wood >= BUILD_COST;
+    game.preview.material = ok ? PREVIEW_MAT_OK : PREVIEW_MAT_BAD;
+    game.preview.userData.okToPlace = ok;
+}
+
+function placeBuild() {
+    const type = slotType();
+    const t = buildTargetPos(type);
+    if (!canPlace(type, t.x, t.y, t.z, t.rotY)) return;
+    if (game.player.wood < BUILD_COST) { showMessage('Zu wenig Holz!'); return; }
+    game.player.wood -= BUILD_COST;
+    const mesh = makeBuildMesh(type);
+    mesh.position.set(t.x, t.y, t.z);
+    mesh.rotation.y = t.rotY;
+    game.scene.add(mesh);
+    const struct = {
+        type, mesh, hp: BUILD_HP,
+        x: t.x, y: t.y, z: t.z, rotY: t.rotY,
+        box: structureBox(type, t.x, t.y, t.z, t.rotY),
+        tiles: null, // used by edit system
+    };
+    game.builds.push(struct);
+    updateHudCounters();
+}
+
+// === Stubs (filled by later sections) =======================
+// === 9. WEAPON / SHOOTING ====================================
+const BULLET_DMG = 22;
+const SHOOT_CD = 0.18;
+const RELOAD_TIME = 1.5;
+
+function shoot() {
+    const p = game.player;
+    if (p.shootCooldown > 0) return;
+    if (p.reloading) return;
+    if (p.ammoClip <= 0) {
+        showMessage('Leer! R zum Nachladen', 800);
+        return;
+    }
+    p.ammoClip--;
+    p.shootCooldown = SHOOT_CD;
+
+    // Raycast from camera forward
+    const origin = p.pos.clone();
+    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(game.camera.quaternion).normalize();
+    game.raycaster.set(origin, dir);
+    game.raycaster.far = 200;
+
+    // Collect candidate objects: enemies + builds (recursive for groups)
+    const targets = [];
+    for (const e of game.enemies) targets.push(e.mesh);
+    for (const b of game.builds) targets.push(b.mesh);
+    const hits = game.raycaster.intersectObjects(targets, true);
+
+    let endPoint;
+    if (hits.length) {
+        const hit = hits[0];
+        endPoint = hit.point.clone();
+        // find owning enemy or build
+        let owner = hit.object;
+        while (owner) {
+            const e = game.enemies.find(en => en.mesh === owner);
+            if (e) { damageEnemy(e, BULLET_DMG); break; }
+            const b = game.builds.find(bu => bu.mesh === owner);
+            if (b) { damageBuild(b, BULLET_DMG); break; }
+            owner = owner.parent;
+        }
+        spawnImpact(endPoint);
+    } else {
+        endPoint = origin.clone().add(dir.clone().multiplyScalar(200));
+    }
+
+    // Tracer line
+    spawnTracer(origin.clone().add(dir.clone().multiplyScalar(0.6)), endPoint);
+    // Muzzle flash: brief point light
+    spawnMuzzleFlash(origin, dir);
+
+    updateHudCounters();
+}
+
+function damageBuild(b, dmg) {
+    b.hp -= dmg;
+    if (b.hp <= 0) destroyBuild(b);
+}
+
+function destroyBuild(b) {
+    game.scene.remove(b.mesh);
+    const i = game.builds.indexOf(b);
+    if (i >= 0) game.builds.splice(i, 1);
+}
+
+function startReload() {
+    const p = game.player;
+    if (p.reloading) return;
+    if (p.ammoClip >= MAX_AMMO_CLIP) return;
+    if (p.ammoReserve <= 0) { showMessage('Keine Munition!'); return; }
+    p.reloading = true;
+    p.reloadTimer = RELOAD_TIME;
+    showMessage('Nachladen...', RELOAD_TIME * 1000);
+}
+
+function updateWeapon(dt) {
+    const p = game.player;
+    if (p.shootCooldown > 0) p.shootCooldown -= dt;
+    if (p.reloading) {
+        p.reloadTimer -= dt;
+        if (p.reloadTimer <= 0) {
+            const need = MAX_AMMO_CLIP - p.ammoClip;
+            const take = Math.min(need, p.ammoReserve);
+            p.ammoClip += take;
+            p.ammoReserve -= take;
+            p.reloading = false;
+            updateHudCounters();
+        }
+    }
+    // auto fire while holding if combat
+    if (game.mouse.down && game.mode === 'combat' && !p.reloading && p.shootCooldown <= 0 && p.ammoClip > 0) {
+        // (semi-auto feels better with pistol; keep single-click only)
+    }
+}
+
+function spawnTracer(from, to) {
+    const geo = new THREE.BufferGeometry().setFromPoints([from, to]);
+    const mat = new THREE.LineBasicMaterial({ color: 0xffff66, transparent: true, opacity: 0.9 });
+    const line = new THREE.Line(geo, mat);
+    line.userData.life = 0.08;
+    game.scene.add(line);
+    game.bullets.push(line);
+}
+
+function spawnMuzzleFlash(origin, dir) {
+    const flash = new THREE.PointLight(0xffcc55, 4, 8);
+    flash.position.copy(origin).add(dir.clone().multiplyScalar(0.4));
+    flash.userData.life = 0.06;
+    game.scene.add(flash);
+    game.particles.push({ obj: flash, life: 0.06, type: 'flash' });
+}
+
+function spawnImpact(point) {
+    for (let i = 0; i < 6; i++) {
+        const s = new THREE.Mesh(
+            new THREE.SphereGeometry(0.05, 4, 4),
+            new THREE.MeshBasicMaterial({ color: 0xffaa33 })
+        );
+        s.position.copy(point);
+        const v = new THREE.Vector3(
+            (Math.random() - 0.5) * 4,
+            Math.random() * 3,
+            (Math.random() - 0.5) * 4
+        );
+        game.scene.add(s);
+        game.particles.push({ obj: s, vel: v, life: 0.4, type: 'spark' });
+    }
+}
+
+function updateBullets(dt) {
+    for (let i = game.bullets.length - 1; i >= 0; i--) {
+        const b = game.bullets[i];
+        b.userData.life -= dt;
+        b.material.opacity = Math.max(0, b.userData.life / 0.08) * 0.9;
+        if (b.userData.life <= 0) {
+            game.scene.remove(b);
+            game.bullets.splice(i, 1);
+        }
+    }
+}
+
+function updateParticles(dt) {
+    for (let i = game.particles.length - 1; i >= 0; i--) {
+        const p = game.particles[i];
+        p.life -= dt;
+        if (p.type === 'spark' && p.vel) {
+            p.vel.y -= 9 * dt;
+            p.obj.position.addScaledVector(p.vel, dt);
+        }
+        if (p.type === 'flash') {
+            p.obj.intensity *= 0.5;
+        }
+        if (p.life <= 0) {
+            game.scene.remove(p.obj);
+            game.particles.splice(i, 1);
+        }
+    }
+}
+// === 10. ENEMIES & WAVES =====================================
+const ENEMY_GEO = new THREE.BoxGeometry(0.9, 1.8, 0.9);
+const ENEMY_MAT = new THREE.MeshStandardMaterial({ color: 0xc03030 });
+const ENEMY_MAT_HURT = new THREE.MeshStandardMaterial({ color: 0xff8888 });
+const ENEMY_RADIUS = 0.55;
+const ENEMY_ATTACK_RANGE = 1.5;
+const ENEMY_ATTACK_CD = 1.0;
+const WAVE_PAUSE = 3.5;
+
+function spawnEnemy() {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = 35 + Math.random() * 15;
+    const x = Math.cos(angle) * dist;
+    const z = Math.sin(angle) * dist;
+    const mesh = new THREE.Mesh(ENEMY_GEO, ENEMY_MAT.clone());
+    mesh.position.set(x, 0.9, z);
+    mesh.castShadow = true;
+    // HP bar (sprite-like plane facing camera)
+    const barBg = new THREE.Mesh(
+        new THREE.PlaneGeometry(1.0, 0.12),
+        new THREE.MeshBasicMaterial({ color: 0x222222, depthTest: false })
+    );
+    barBg.position.set(0, 1.3, 0);
+    barBg.renderOrder = 10;
+    mesh.add(barBg);
+    const bar = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.96, 0.08),
+        new THREE.MeshBasicMaterial({ color: 0x00ff44, depthTest: false })
+    );
+    bar.position.set(0, 1.3, 0.01);
+    bar.renderOrder = 11;
+    mesh.add(bar);
+    game.scene.add(mesh);
+    const hpMax = ENEMY_HP_BASE + (game.player.wave - 1) * 10;
+    const e = {
+        mesh, bar, barBg,
+        pos: mesh.position,
+        hp: hpMax, hpMax,
+        attackCd: 0,
+        hurtTimer: 0,
+    };
+    game.enemies.push(e);
+}
+
+function enemyBox(e) {
+    return new THREE.Box3(
+        new THREE.Vector3(e.pos.x - ENEMY_RADIUS, 0, e.pos.z - ENEMY_RADIUS),
+        new THREE.Vector3(e.pos.x + ENEMY_RADIUS, 1.8, e.pos.z + ENEMY_RADIUS)
+    );
+}
+
+function moveEnemyWithCollision(e, delta) {
+    const next = e.pos.clone().add(delta);
+    const oldX = e.pos.x, oldZ = e.pos.z;
+    e.pos.x = next.x;
+    if (enemyBlocked(e)) e.pos.x = oldX;
+    e.pos.z = next.z;
+    if (enemyBlocked(e)) e.pos.z = oldZ;
+    e.mesh.position.set(e.pos.x, 0.9, e.pos.z);
+}
+
+function enemyBlocked(e) {
+    const box = enemyBox(e);
+    for (const b of game.builds) {
+        if (!b.box.intersectsBox(box)) continue;
+        if (b.tileBoxes && b.tileBoxes.length) {
+            for (const tb of b.tileBoxes) if (tb.intersectsBox(box)) return true;
+        } else return true;
+    }
+    for (const wb of game.worldBoxes) if (wb.intersectsBox(box)) return true;
+    return false;
+}
+
+function updateEnemies(dt) {
+    for (let i = game.enemies.length - 1; i >= 0; i--) {
+        const e = game.enemies[i];
+        // Move toward player
+        const toPlayer = new THREE.Vector3(
+            game.player.pos.x - e.pos.x,
+            0,
+            game.player.pos.z - e.pos.z
+        );
+        const distXZ = toPlayer.length();
+        if (distXZ > 0.01) toPlayer.multiplyScalar(1 / distXZ);
+        // Face player
+        e.mesh.rotation.y = Math.atan2(toPlayer.x, toPlayer.z);
+
+        if (distXZ > ENEMY_ATTACK_RANGE - 0.2) {
+            const step = toPlayer.multiplyScalar(ENEMY_SPEED * dt);
+            moveEnemyWithCollision(e, step);
+        }
+
+        // Attack
+        if (e.attackCd > 0) e.attackCd -= dt;
+        const dReal = Math.hypot(
+            game.player.pos.x - e.pos.x,
+            game.player.pos.z - e.pos.z
+        );
+        if (dReal <= ENEMY_ATTACK_RANGE && e.attackCd <= 0) {
+            e.attackCd = ENEMY_ATTACK_CD;
+            damagePlayer(ENEMY_DMG);
+        }
+
+        // Hurt flash
+        if (e.hurtTimer > 0) {
+            e.hurtTimer -= dt;
+            e.mesh.material = ENEMY_MAT_HURT;
+            if (e.hurtTimer <= 0) e.mesh.material = ENEMY_MAT;
+        }
+
+        // Face HP bar at camera
+        e.bar.lookAt(game.camera.position);
+        e.barBg.lookAt(game.camera.position);
+        e.bar.scale.x = Math.max(0, e.hp / e.hpMax);
+        e.bar.position.x = -(1 - e.bar.scale.x) * 0.48;
+    }
+}
+
+function damageEnemy(e, dmg) {
+    e.hp -= dmg;
+    e.hurtTimer = 0.1;
+    if (e.hp <= 0) killEnemy(e);
+}
+
+function killEnemy(e) {
+    game.scene.remove(e.mesh);
+    const i = game.enemies.indexOf(e);
+    if (i >= 0) game.enemies.splice(i, 1);
+    game.player.kills++;
+    // drop a bit of wood
+    game.player.wood += 20;
+    updateHudCounters();
+}
+
+function damagePlayer(dmg) {
+    const p = game.player;
+    if (p.shield > 0) {
+        const absorbed = Math.min(p.shield, dmg);
+        p.shield -= absorbed;
+        dmg -= absorbed;
+    }
+    p.hp -= dmg;
+    p.damageFlashTimer = 0.25;
+    document.body.classList.add('damage');
+    updateHudCounters();
+    if (p.hp <= 0) gameOver();
+}
+
+function updateWaves(dt) {
+    // spawn queued enemies gradually
+    if (game.spawnQueue > 0) {
+        game.waveTimer -= dt;
+        if (game.waveTimer <= 0) {
+            spawnEnemy();
+            game.spawnQueue--;
+            game.waveTimer = 0.6;
+            updateHudCounters();
+        }
+    } else if (game.enemies.length === 0) {
+        // wave cleared — start next
+        game.waveTimer -= dt;
+        if (game.waveTimer <= -WAVE_PAUSE) {
+            game.player.wave++;
+            game.spawnQueue = 3 + game.player.wave * 2;
+            game.waveTimer = 0.4;
+            showMessage('Welle ' + game.player.wave, 1500);
+            updateHudCounters();
+        }
+    }
+}
+
+function startWaves() {
+    game.player.wave = 1;
+    game.spawnQueue = 5;
+    game.waveTimer = 1.0;
+    showMessage('Welle 1', 1500);
+}
+function updateDamageFlash(dt) {
+    if (game.player.damageFlashTimer > 0) {
+        game.player.damageFlashTimer -= dt;
+        if (game.player.damageFlashTimer <= 0) document.body.classList.remove('damage');
+    }
+}
+function handleClick() {
+    if (game.mode === 'build') { placeBuild(); return; }
+    if (game.mode === 'edit') { editClick(); return; }
+    if (game.mode === 'combat') { shoot(); return; }
+}
+
+function showMessage(text, ms = 1500) {
+    const el = document.getElementById('message');
+    el.textContent = text;
+    el.classList.remove('hidden');
+    clearTimeout(showMessage._t);
+    showMessage._t = setTimeout(() => el.classList.add('hidden'), ms);
+}
+
+function updateHudCounters() {
+    document.getElementById('wood-count').textContent = game.player.wood;
+    document.getElementById('score').textContent = 'Kills: ' + game.player.kills;
+    document.getElementById('wave').textContent = 'Welle: ' + game.player.wave;
+    document.getElementById('enemies-left').textContent = 'Gegner: ' + (game.enemies.length + game.spawnQueue);
+    const hpPct = Math.max(0, game.player.hp) / MAX_HP * 100;
+    const shPct = Math.max(0, game.player.shield) / MAX_SHIELD * 100;
+    document.getElementById('health-bar').style.width = hpPct + '%';
+    document.getElementById('shield-bar').style.width = shPct + '%';
+    document.getElementById('health-text').textContent = Math.max(0, Math.round(game.player.hp));
+    document.getElementById('shield-text').textContent = Math.max(0, Math.round(game.player.shield));
+    document.getElementById('ammo-text').textContent = game.player.ammoClip + ' / ' + game.player.ammoReserve;
+}
+// === 8. EDIT SYSTEM ==========================================
+// Classic Fortnite-style: look at your own structure, press G → 3×3 overlay.
+// Click cells to toggle them OFF, press G again to commit (cells toggled off
+// become holes; wall with middle-bottom removed = door).
+
+const EDIT_CELL_MAT_ON  = new THREE.MeshBasicMaterial({ color: 0x00ccff, transparent: true, opacity: 0.35, side: THREE.DoubleSide });
+const EDIT_CELL_MAT_OFF = new THREE.MeshBasicMaterial({ color: 0xff6600, transparent: true, opacity: 0.35, side: THREE.DoubleSide });
+
+function getLookedAtBuild() {
+    const origin = game.player.pos.clone();
+    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(game.camera.quaternion);
+    game.raycaster.set(origin, dir);
+    game.raycaster.far = 6;
+    const meshes = game.builds.map(b => b.mesh);
+    const hits = game.raycaster.intersectObjects(meshes, true); // recurse into groups
+    if (!hits.length) return null;
+    // walk up to find the owning build
+    return game.builds.find(b => {
+        let o = hits[0].object;
+        while (o) { if (o === b.mesh) return true; o = o.parent; }
+        return false;
+    }) || null;
+}
+
+function toggleEditMode() {
+    if (game.mode === 'edit') {
+        commitEdit();
+        return;
+    }
+    const struct = getLookedAtBuild();
+    if (!struct) { showMessage('Keine Struktur im Visier', 800); return; }
+    if (struct.type === 'ramp' || struct.type === 'roof') {
+        showMessage('Nur Wand & Boden editierbar', 1200);
+        return;
+    }
+    startEdit(struct);
+}
+
+function startEdit(struct) {
+    game.editing = struct;
+    game.mode = 'edit';
+    // restore from existing tiles or default 3x3 all ON
+    game.editGrid = struct.tiles ? struct.tiles.map(row => row.slice()) : [
+        [1,1,1],
+        [1,1,1],
+        [1,1,1],
+    ];
+    buildEditOverlay(struct);
+    document.getElementById('edit-hint').classList.remove('hidden');
+    updateModeHud();
+}
+
+function buildEditOverlay(struct) {
+    clearEditOverlay();
+    const size = GRID / 3;
+    for (let r = 0; r < 3; r++) {
+        for (let c = 0; c < 3; c++) {
+            const geo = new THREE.PlaneGeometry(size * 0.92, size * 0.92);
+            const m = new THREE.Mesh(geo, game.editGrid[r][c] ? EDIT_CELL_MAT_ON : EDIT_CELL_MAT_OFF);
+            // position cell relative to struct; local offsets, then transform by struct
+            let lx = (c - 1) * size;
+            let ly = (1 - r) * size; // row 0 on top
+            let lz = 0;
+            if (struct.type === 'floor') {
+                // lay flat on top of floor; cells on XZ plane
+                lx = (c - 1) * size;
+                ly = 0.2; // slightly above floor
+                lz = (r - 1) * size;
+                m.rotation.x = -Math.PI / 2;
+            } else {
+                // wall: local XY plane, rotated by struct rotation around Y
+                m.position.set(lx, ly, lz + 0.2);
+                m.rotation.y = 0;
+            }
+            const world = new THREE.Vector3(lx, ly, lz);
+            if (struct.type === 'wall') {
+                // rotate XZ of offset by rotY
+                const cos = Math.cos(struct.rotY), sin = Math.sin(struct.rotY);
+                const wx = world.x * cos + world.z * sin;
+                const wz = -world.x * sin + world.z * cos;
+                world.x = wx; world.z = wz;
+                // push slightly in front of wall
+                world.x += Math.sin(struct.rotY) * 0.2;
+                world.z += Math.cos(struct.rotY) * 0.2;
+                m.rotation.y = struct.rotY;
+            }
+            m.position.set(
+                struct.x + world.x,
+                struct.y + world.y,
+                struct.z + world.z
+            );
+            m.userData = { r, c, struct };
+            game.scene.add(m);
+            game.editMeshes.push(m);
+        }
+    }
+}
+
+function clearEditOverlay() {
+    for (const m of game.editMeshes) game.scene.remove(m);
+    game.editMeshes = [];
+    document.getElementById('edit-hint').classList.add('hidden');
+}
+
+function editClick() {
+    // raycast against edit cells
+    const origin = game.player.pos.clone();
+    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(game.camera.quaternion);
+    game.raycaster.set(origin, dir);
+    game.raycaster.far = 8;
+    const hits = game.raycaster.intersectObjects(game.editMeshes, false);
+    if (!hits.length) return;
+    const cell = hits[0].object;
+    const { r, c } = cell.userData;
+    game.editGrid[r][c] = game.editGrid[r][c] ? 0 : 1;
+    cell.material = game.editGrid[r][c] ? EDIT_CELL_MAT_ON : EDIT_CELL_MAT_OFF;
+}
+
+function commitEdit() {
+    const s = game.editing;
+    if (!s) return;
+    s.tiles = game.editGrid.map(row => row.slice());
+    // Rebuild mesh: remove full box, re-add only enabled cells
+    game.scene.remove(s.mesh);
+    const group = new THREE.Group();
+    const size = GRID / 3;
+    const mat = s.type === 'wall' ? BUILD_MAT_WALL : BUILD_MAT_FLOOR;
+    for (let r = 0; r < 3; r++) {
+        for (let c = 0; c < 3; c++) {
+            if (!s.tiles[r][c]) continue;
+            let cellMesh;
+            if (s.type === 'wall') {
+                cellMesh = new THREE.Mesh(new THREE.BoxGeometry(size * 0.98, size * 0.98, 0.25), mat);
+                cellMesh.position.set((c - 1) * size, (1 - r) * size, 0);
+            } else {
+                cellMesh = new THREE.Mesh(new THREE.BoxGeometry(size * 0.98, 0.25, size * 0.98), mat);
+                cellMesh.position.set((c - 1) * size, 0, (r - 1) * size);
+            }
+            cellMesh.castShadow = true;
+            cellMesh.receiveShadow = true;
+            group.add(cellMesh);
+        }
+    }
+    group.position.set(s.x, s.y, s.z);
+    group.rotation.y = s.rotY;
+    game.scene.add(group);
+    s.mesh = group;
+    // Build per-tile collision boxes so the player can walk through removed cells (doors/windows)
+    group.updateMatrixWorld(true);
+    s.tileBoxes = [];
+    group.traverse(obj => {
+        if (obj.isMesh) {
+            s.tileBoxes.push(new THREE.Box3().setFromObject(obj));
+        }
+    });
+    s.box = structureBox(s.type, s.x, s.y, s.z, s.rotY); // outer bounding for quick reject
+    clearEditOverlay();
+    game.editing = null;
+    game.mode = 'build';
+    updateModeHud();
+    updatePreview();
+}
+
+function cancelEdit() {
+    clearEditOverlay();
+    game.editing = null;
+    game.editGrid = [];
+}
+function updateSlotHud() {
+    document.querySelectorAll('.slot').forEach(s => {
+        s.classList.toggle('active', parseInt(s.dataset.slot) === game.slot);
+    });
+}
+function updateModeHud() {
+    const el = document.getElementById('mode-indicator');
+    el.className = '';
+    if (game.mode === 'combat') { el.textContent = 'KAMPF'; el.classList.add('combat'); }
+    else if (game.mode === 'build') { el.textContent = 'BAU-MODUS'; el.classList.add('build'); }
+    else if (game.mode === 'edit') { el.textContent = 'EDIT-MODUS'; el.classList.add('edit'); }
+}
+
+// === 11. GAME OVER / RESTART =================================
+function gameOver() {
+    game.running = false;
+    game.paused = true;
+    document.exitPointerLock();
+    document.getElementById('final-score').textContent =
+        'Kills: ' + game.player.kills + ' | Welle: ' + game.player.wave;
+    document.getElementById('game-over').classList.remove('hidden');
+}
+
+function restart() {
+    // Clear builds
+    for (const b of game.builds) game.scene.remove(b.mesh);
+    game.builds = [];
+    // Clear enemies
+    for (const e of game.enemies) game.scene.remove(e.mesh);
+    game.enemies = [];
+    // Clear particles/bullets
+    for (const b of game.bullets) game.scene.remove(b);
+    game.bullets = [];
+    for (const p of game.particles) game.scene.remove(p.obj);
+    game.particles = [];
+    // Reset player
+    game.player.pos.set(0, PLAYER_HEIGHT, 0);
+    game.player.vel.set(0, 0, 0);
+    game.player.hp = MAX_HP;
+    game.player.shield = MAX_SHIELD;
+    game.player.wood = 500;
+    game.player.kills = 0;
+    game.player.wave = 1;
+    game.player.ammoClip = MAX_AMMO_CLIP;
+    game.player.ammoReserve = MAX_AMMO_RESERVE;
+    game.player.reloading = false;
+    game.player.shootCooldown = 0;
+    game.slot = 1;
+    game.mode = 'combat';
+    if (game.editing) cancelEdit();
+    updateSlotHud();
+    updateModeHud();
+    updateHudCounters();
+    document.getElementById('game-over').classList.add('hidden');
+    document.body.classList.remove('damage');
+    game.running = true;
+    game.paused = true; // resumes on pointer lock
+    startWaves();
+}
+
+// === INIT ====================================================
+function init() {
+    setupScene();
+    setupInput();
+    game.clock = new THREE.Clock();
+    game.running = true;
+    updateSlotHud();
+    updateModeHud();
+    updateHudCounters();
+
+    document.getElementById('restart-btn').addEventListener('click', restart);
+
+    if (!('requestPointerLock' in document.body)) {
+        showMessage('Browser unterstützt Pointer Lock nicht', 4000);
+    }
+
+    startWaves();
+    loop();
+}
+
+init();
