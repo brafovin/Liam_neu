@@ -41,6 +41,12 @@ const WEAPONS = {
         spread: 0.015, pellets: 1, range: 200, auto: false,
         reload: RELOAD_TIME, tracerColor: 0xffff66,
     },
+    smg: {
+        id: 'smg', name: 'SMG', icon: '🔫',
+        dmg: 11, cd: 0.055, clip: 40, start: 120, max: 400,
+        spread: 0.055, pellets: 1, range: 140, auto: true,
+        reload: 1.8, tracerColor: 0xffee88,
+    },
     ak: {
         id: 'ak', name: 'AK47', icon: '🗡️',
         dmg: 18, cd: 0.09, clip: 30, start: 90, max: 300,
@@ -59,8 +65,17 @@ const WEAPONS = {
         spread: 0.0, pellets: 1, range: 400, auto: false,
         reload: SNIPER_RELOAD, tracerColor: 0x66ffcc,
     },
+    rocket: {
+        id: 'rocket', name: 'Raketenwerfer', icon: '🚀',
+        dmg: 220, cd: 1.4, clip: 1, start: 3, max: 12,
+        spread: 0.0, pellets: 1, range: 250, auto: false,
+        reload: 2.8, tracerColor: 0xff6622,
+        projectile: true, splashRadius: 6.0, rocketSpeed: 38,
+    },
 };
-const WEAPON_ORDER = ['pistol', 'ak', 'shotgun', 'sniper'];
+// Order matters: slots 1..6 map to this list, and boss kills unlock the NEXT
+// locked weapon in order.
+const WEAPON_ORDER = ['pistol', 'smg', 'ak', 'shotgun', 'sniper', 'rocket'];
 
 function makeInitialWeaponAmmo() {
     const out = {};
@@ -68,6 +83,21 @@ function makeInitialWeaponAmmo() {
         out[id] = { clip: WEAPONS[id].clip, reserve: WEAPONS[id].start };
     }
     return out;
+}
+
+function makeInitialUnlocks() {
+    // Only the pistol is unlocked at the start. Bosses drop the rest.
+    const out = {};
+    for (const id of WEAPON_ORDER) out[id] = false;
+    out.pistol = true;
+    return out;
+}
+
+// Returns the slot index in our hotbar (1..10) for a given weapon id,
+// or -1 if not a weapon slot.
+function weaponSlotOf(id) {
+    const idx = WEAPON_ORDER.indexOf(id);
+    return idx < 0 ? -1 : idx + 1;
 }
 
 const game = {
@@ -82,10 +112,12 @@ const game = {
         medkits: START_MEDKITS,
         currentWeapon: 'pistol',
         weaponAmmo: makeInitialWeaponAmmo(),
+        unlockedWeapons: makeInitialUnlocks(),
         reloading: false, reloadTimer: 0,
         shootCooldown: 0,
         healCd: 0,
         damageFlashTimer: 0,
+        lastDamageTime: 0,
     },
     keys: {},
     mouse: { down: false, rightDown: false },
@@ -99,6 +131,7 @@ const game = {
     bossQueue: 0,
     bullets: [],      // visual tracers
     bossProjectiles: [],
+    rockets: [],      // player rocket launcher projectiles
     particles: [],
     preview: null,    // ghost preview mesh
     editing: null,    // struct being edited
@@ -254,6 +287,7 @@ function setupInput() {
         else if (e.code === 'Digit7') selectSlot(7);
         else if (e.code === 'Digit8') selectSlot(8);
         else if (e.code === 'Digit9') selectSlot(9);
+        else if (e.code === 'Digit0') selectSlot(10);
         else if (e.code === 'KeyR') startReload();
         else if (e.code === 'KeyG') toggleEditMode();
     });
@@ -273,6 +307,29 @@ function setupInput() {
     });
     document.addEventListener('contextmenu', (e) => e.preventDefault());
 
+    // Mouse wheel cycles through the hotbar. Scrolling down advances, up
+    // retreats. Locked weapon slots are skipped so cycling never strands you
+    // on an unusable slot.
+    document.addEventListener('wheel', (e) => {
+        if (!game.locked) return;
+        e.preventDefault();
+        const dir = e.deltaY > 0 ? 1 : -1;
+        let next = game.slot;
+        // Try up to 10 steps to find a usable slot.
+        for (let i = 0; i < 10; i++) {
+            next += dir;
+            if (next > 10) next = 1;
+            if (next < 1) next = 10;
+            if (next >= 1 && next <= 6) {
+                const id = WEAPON_ORDER[next - 1];
+                if (game.player.unlockedWeapons[id]) break;
+                continue; // locked → keep scanning
+            }
+            break; // medkit or build slot → always selectable
+        }
+        if (next !== game.slot) selectSlot(next);
+    }, { passive: false });
+
     window.addEventListener('resize', () => {
         game.camera.aspect = innerWidth / innerHeight;
         game.camera.updateProjectionMatrix();
@@ -281,18 +338,27 @@ function setupInput() {
 }
 
 function selectSlot(n) {
-    game.slot = n;
-    if (n >= 1 && n <= 4) {
+    // Slots 1..6: weapons, 7: medkit, 8..10: builds (wall, floor, ramp).
+    if (n >= 1 && n <= 6) {
+        const id = WEAPON_ORDER[n - 1];
+        if (!game.player.unlockedWeapons[id]) {
+            showMessage(WEAPONS[id].name + ' GESPERRT — besiege den nächsten Boss', 1400);
+            return; // keep current slot
+        }
+        game.slot = n;
         game.mode = 'combat';
-        game.player.currentWeapon = WEAPON_ORDER[n - 1];
-        // Cancel an in-progress reload from a different weapon
+        game.player.currentWeapon = id;
         game.player.reloading = false;
         game.player.reloadTimer = 0;
-        game.player.shootCooldown = 0.05; // tiny delay to avoid instant swap-fire
-    } else if (n === 5) {
+        game.player.shootCooldown = 0.05;
+    } else if (n === 7) {
+        game.slot = n;
         game.mode = 'heal';
-    } else if (n >= 6 && n <= 9) {
+    } else if (n >= 8 && n <= 10) {
+        game.slot = n;
         game.mode = 'build';
+    } else {
+        return;
     }
     if (game.editing) cancelEdit();
     updateSlotHud();
@@ -463,7 +529,9 @@ function loop() {
             updateBossProjectiles(dt);
             updateWaves(dt);
         }
+        updateRockets(dt);
         updateWeapon(dt);
+        updateShieldRegen(dt);
         updateDamageFlash(dt);
     }
     game.renderer.render(game.scene, game.camera);
@@ -503,7 +571,9 @@ function makeBuildMesh(type, damaged) {
 }
 
 function slotType() {
-    return ['wall','floor','ramp','roof'][game.slot - 6] || 'wall';
+    // Slot 8 = wall, 9 = floor, 10 = ramp. (Roof dropped from hotbar to make room
+    // for the new weapons — rampe is the main mobility piece anyway.)
+    return ['wall','floor','ramp'][game.slot - 8] || 'wall';
 }
 
 function snap(v) { return Math.round(v / GRID) * GRID; }
@@ -705,15 +775,25 @@ function shoot() {
     p.shootCooldown = w.cd;
     if (ammo.clip === 0 && ammo.reserve > 0) startReload();
 
+    const origin = p.pos.clone();
+    const baseDir = new THREE.Vector3(0, 0, -1).applyQuaternion(game.camera.quaternion).normalize();
+
+    // Projectile weapons (rocket launcher): skip the raycast pellet loop and
+    // launch a physics rocket instead.
+    if (w.projectile) {
+        spawnRocket(origin, baseDir, w);
+        spawnMuzzleFlash(origin, baseDir);
+        game.viewmodelRecoil = Math.min(0.3, game.viewmodelRecoil + 0.18);
+        updateHudCounters();
+        return;
+    }
+
     // Collect candidate targets. Enemies are represented by their invisible
     // HITBOX child mesh (bigger than the visual) so aiming is forgiving.
     const targets = [];
     for (const e of game.enemies) if (e.hitbox) targets.push(e.hitbox);
     for (const d of game.dummies) targets.push(d.hitbox);
     for (const b of game.builds) targets.push(b.mesh);
-
-    const origin = p.pos.clone();
-    const baseDir = new THREE.Vector3(0, 0, -1).applyQuaternion(game.camera.quaternion).normalize();
 
     // Accumulate damage per target so shotgun pellets show one combined number.
     const shotSummary = new Map(); // target → { amount, pos, head }
@@ -737,19 +817,21 @@ function shoot() {
             if (obj.userData && obj.userData.isHitbox && obj.userData.enemy) {
                 const e = obj.userData.enemy;
                 // Headshot: hit point's Y is above a threshold relative to mesh center.
-                const headThreshold = e.isBoss ? 0.9 : 0.4;
+                const headThreshold = e.isBoss ? 0.7 : 0.55;
                 const headshot = (endPoint.y - e.pos.y) > headThreshold;
                 const mult = headshot ? (e.isBoss ? HEADSHOT_MULT_BOSS : HEADSHOT_MULT_ENEMY) : 1;
                 const dealt = w.dmg * mult;
                 damageEnemy(e, dealt);
                 accumulateDamage(shotSummary, e, dealt, endPoint, headshot);
+                flashHitMarker(headshot);
             } else if (obj.userData && obj.userData.isDummy) {
                 const d = obj.userData.dummy;
-                const headshot = (endPoint.y - d.mesh.position.y) > 0.4;
+                const headshot = (endPoint.y - d.mesh.position.y) > 0.55;
                 const mult = headshot ? HEADSHOT_MULT_DUMMY : 1;
                 const dealt = w.dmg * mult;
                 damageDummy(d, dealt);
                 accumulateDamage(shotSummary, d, dealt, endPoint, headshot);
+                flashHitMarker(headshot);
             } else {
                 // Must be a build (or child of a build group)
                 let owner = obj;
@@ -836,6 +918,183 @@ function updateWeapon(dt) {
         && !p.reloading && p.shootCooldown <= 0) {
         shoot();
     }
+}
+
+// === ROCKETS (player rocket launcher) ========================
+function spawnRocket(origin, dir, w) {
+    const body = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.1, 0.1, 0.7, 10),
+        new THREE.MeshStandardMaterial({ color: 0x555555, metalness: 0.6, roughness: 0.5 })
+    );
+    const tip = new THREE.Mesh(
+        new THREE.ConeGeometry(0.1, 0.2, 10),
+        new THREE.MeshStandardMaterial({ color: 0xff4422 })
+    );
+    tip.position.y = 0.45;
+    body.add(tip);
+    // Align cylinder (local Y) to the fire direction
+    body.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+    body.position.copy(origin).add(dir.clone().multiplyScalar(0.8));
+
+    // Trail light
+    const light = new THREE.PointLight(0xff7733, 2.5, 8);
+    body.add(light);
+
+    game.scene.add(body);
+    game.rockets.push({
+        mesh: body,
+        pos: body.position,
+        dir: dir.clone().normalize(),
+        speed: w.rocketSpeed || 38,
+        life: 4.0,
+        dmg: w.dmg,
+        splash: w.splashRadius || 6.0,
+    });
+}
+
+function updateRockets(dt) {
+    for (let i = game.rockets.length - 1; i >= 0; i--) {
+        const r = game.rockets[i];
+        r.life -= dt;
+        const step = r.dir.clone().multiplyScalar(r.speed * dt);
+        r.pos.add(step);
+
+        let hit = false;
+
+        // Collide with enemies (direct hit). e.pos is the body group origin,
+        // which sits at body vertical center, so we hit-test against that.
+        for (const e of game.enemies) {
+            if (e.dead) continue;
+            const dx = r.pos.x - e.pos.x;
+            const dy = r.pos.y - e.pos.y;
+            const dz = r.pos.z - e.pos.z;
+            const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+            if (dist < (e.radius || 0.6) + 0.6) { hit = true; break; }
+        }
+        // Direct hit on lobby dummies too
+        if (!hit) {
+            for (const d of game.dummies) {
+                if (d.dead) continue;
+                const dx = r.pos.x - d.mesh.position.x;
+                const dy = r.pos.y - d.mesh.position.y;
+                const dz = r.pos.z - d.mesh.position.z;
+                if (dx*dx + dy*dy + dz*dz < 1.1 * 1.1) { hit = true; break; }
+            }
+        }
+
+        // Collide with builds
+        if (!hit) {
+            const pbox = new THREE.Box3(
+                new THREE.Vector3(r.pos.x - 0.35, r.pos.y - 0.35, r.pos.z - 0.35),
+                new THREE.Vector3(r.pos.x + 0.35, r.pos.y + 0.35, r.pos.z + 0.35)
+            );
+            for (const b of game.builds) {
+                if (!b.box.intersectsBox(pbox)) continue;
+                if (b.tileBoxes && b.tileBoxes.length) {
+                    for (const tb of b.tileBoxes) if (tb.intersectsBox(pbox)) { hit = true; break; }
+                } else hit = true;
+                if (hit) break;
+            }
+        }
+
+        // Ground hit
+        if (!hit && r.pos.y <= 0) hit = true;
+
+        if (hit || r.life <= 0) {
+            explodeRocket(r);
+            game.scene.remove(r.mesh);
+            game.rockets.splice(i, 1);
+        }
+    }
+}
+
+function explodeRocket(r) {
+    const pos = r.pos.clone();
+    const radius = r.splash;
+
+    // Splash damage to every enemy in range, with quadratic falloff.
+    for (const e of game.enemies) {
+        if (e.dead) continue;
+        const dx = pos.x - e.pos.x;
+        const dy = pos.y - e.pos.y;
+        const dz = pos.z - e.pos.z;
+        const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        if (d > radius) continue;
+        const fall = 1 - (d / radius);
+        const dmg = Math.max(20, r.dmg * fall * fall);
+        damageEnemy(e, dmg);
+        // Spawn a combined damage number above the enemy head
+        const numPos = new THREE.Vector3(e.pos.x, e.pos.y + 1.2, e.pos.z);
+        spawnDamageNumber(numPos, dmg, false);
+    }
+
+    // Splash damage on dummies (so rockets work at the practice range)
+    for (const d of game.dummies) {
+        if (d.dead) continue;
+        const dx = pos.x - d.mesh.position.x;
+        const dy = pos.y - d.mesh.position.y;
+        const dz = pos.z - d.mesh.position.z;
+        const dd = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        if (dd > radius) continue;
+        const fall = 1 - (dd / radius);
+        damageDummy(d, Math.max(20, r.dmg * fall * fall));
+    }
+
+    // Damage nearby builds too (destroys walls)
+    for (let i = game.builds.length - 1; i >= 0; i--) {
+        const b = game.builds[i];
+        const cx = (b.box.min.x + b.box.max.x) / 2;
+        const cy = (b.box.min.y + b.box.max.y) / 2;
+        const cz = (b.box.min.z + b.box.max.z) / 2;
+        const d = Math.sqrt((pos.x-cx)**2 + (pos.y-cy)**2 + (pos.z-cz)**2);
+        if (d > radius) continue;
+        const fall = 1 - (d / radius);
+        damageBuild(b, r.dmg * fall * 0.8);
+    }
+
+    // Self-damage if player is too close (but reduced — rocket jumping possible).
+    const pdx = pos.x - game.player.pos.x;
+    const pdy = pos.y - (game.player.pos.y - PLAYER_HEIGHT / 2);
+    const pdz = pos.z - game.player.pos.z;
+    const pdist = Math.sqrt(pdx*pdx + pdy*pdy + pdz*pdz);
+    if (pdist < radius * 0.75) {
+        const fall = 1 - (pdist / (radius * 0.75));
+        damagePlayer(Math.floor(r.dmg * fall * 0.2));
+    }
+
+    spawnExplosion(pos, radius);
+}
+
+function spawnExplosion(pos, radius) {
+    // Flash point light
+    const light = new THREE.PointLight(0xffaa44, 8, radius * 3);
+    light.position.copy(pos);
+    game.scene.add(light);
+    game.particles.push({ obj: light, life: 0.35, type: 'flash' });
+
+    // Many orange sparks flying outward
+    for (let i = 0; i < 40; i++) {
+        const s = new THREE.Mesh(
+            new THREE.SphereGeometry(0.12, 4, 4),
+            new THREE.MeshBasicMaterial({ color: Math.random() < 0.5 ? 0xff6622 : 0xffcc33 })
+        );
+        s.position.copy(pos);
+        const v = new THREE.Vector3(
+            (Math.random() - 0.5) * 22,
+            Math.random() * 16,
+            (Math.random() - 0.5) * 22
+        );
+        game.scene.add(s);
+        game.particles.push({ obj: s, vel: v, life: 0.9, type: 'spark' });
+    }
+    // Central fireball sphere that fades
+    const ball = new THREE.Mesh(
+        new THREE.SphereGeometry(radius * 0.35, 14, 14),
+        new THREE.MeshBasicMaterial({ color: 0xffaa22, transparent: true, opacity: 0.85 })
+    );
+    ball.position.copy(pos);
+    game.scene.add(ball);
+    game.particles.push({ obj: ball, life: 0.4, type: 'fireball' });
 }
 
 function spawnTracer(from, to, color = 0xffff66) {
@@ -1066,6 +1325,12 @@ function updateParticles(dt) {
         if (p.type === 'flash') {
             p.obj.intensity *= 0.5;
         }
+        if (p.type === 'fireball') {
+            // Grow and fade the fireball sphere
+            const s = 1 + (1 - p.life / 0.4) * 1.2;
+            p.obj.scale.set(s, s, s);
+            if (p.obj.material) p.obj.material.opacity = Math.max(0, p.life / 0.4) * 0.85;
+        }
         if (p.life <= 0) {
             game.scene.remove(p.obj);
             game.particles.splice(i, 1);
@@ -1073,23 +1338,94 @@ function updateParticles(dt) {
     }
 }
 // === 10. ENEMIES, BOSSES & WAVES =============================
-const ENEMY_GEO = new THREE.BoxGeometry(0.9, 1.8, 0.9);
-const ENEMY_MAT = new THREE.MeshStandardMaterial({ color: 0xc03030 });
+const ENEMY_MAT = new THREE.MeshStandardMaterial({ color: 0xa02828 });
 const ENEMY_MAT_HURT = new THREE.MeshStandardMaterial({ color: 0xff8888 });
+const ENEMY_HEAD_MAT = new THREE.MeshStandardMaterial({ color: 0x8a1010 });
 const ENEMY_RADIUS = 0.55;
 const ENEMY_ATTACK_RANGE = 1.5;
 const ENEMY_ATTACK_CD = 1.0;
 const WAVE_PAUSE = 3.5;
-const BOSS_GEO = new THREE.BoxGeometry(2.4, 3.6, 2.4);
 const BOSS_MAT = new THREE.MeshStandardMaterial({
     color: 0x550011, emissive: 0x330000, emissiveIntensity: 0.6, metalness: 0.4, roughness: 0.6,
 });
 const BOSS_MAT_HURT = new THREE.MeshStandardMaterial({
     color: 0xff3344, emissive: 0x660000, emissiveIntensity: 0.8,
 });
+const BOSS_HEAD_MAT = new THREE.MeshStandardMaterial({
+    color: 0x330000, emissive: 0x220000, emissiveIntensity: 0.5,
+});
 const BOSS_RADIUS = 1.3;
-const BOSS_ATTACK_RANGE = 2.5;
+const BOSS_ATTACK_RANGE = 2.8;
 const BOSS_ATTACK_CD = 1.4;
+
+// Builds a simple humanoid made of boxes: head, torso, arms, legs.
+// Returns { group, bodyParts } — bodyParts is the list of meshes whose material
+// gets swapped on hurt flash, excluding the eyes.
+function makeEnemyBody(bodyMat, headMat) {
+    const g = new THREE.Group();
+    const parts = [];
+    const mkPart = (geo, mat, x, y, z) => {
+        const m = new THREE.Mesh(geo, mat);
+        m.position.set(x, y, z);
+        m.castShadow = true;
+        m.userData.originalMat = mat; // for hurt-flash restoration
+        g.add(m);
+        parts.push(m);
+        return m;
+    };
+    mkPart(new THREE.BoxGeometry(0.25, 0.75, 0.25), bodyMat, -0.15, -0.525, 0);     // left leg
+    mkPart(new THREE.BoxGeometry(0.25, 0.75, 0.25), bodyMat,  0.15, -0.525, 0);     // right leg
+    mkPart(new THREE.BoxGeometry(0.65, 0.7,  0.35), bodyMat,  0,    0.2,   0);      // torso
+    mkPart(new THREE.BoxGeometry(0.2,  0.7,  0.2),  bodyMat, -0.42, 0.2,   0);      // left arm
+    mkPart(new THREE.BoxGeometry(0.2,  0.7,  0.2),  bodyMat,  0.42, 0.2,   0);      // right arm
+    const head = mkPart(new THREE.BoxGeometry(0.45, 0.4, 0.4), headMat, 0, 0.75, 0);
+    // Eyes on the head front (local -Z). Not in `parts` so they keep glowing.
+    const eyeMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+    const eyeL = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.07, 0.02), eyeMat);
+    const eyeR = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.07, 0.02), eyeMat);
+    eyeL.position.set(-0.1, 0.02, -0.21);
+    eyeR.position.set( 0.1, 0.02, -0.21);
+    head.add(eyeL); head.add(eyeR);
+    return { group: g, bodyParts: parts };
+}
+
+function makeBossBody(bodyMat, headMat) {
+    const g = new THREE.Group();
+    const parts = [];
+    const mkPart = (geo, mat, x, y, z) => {
+        const m = new THREE.Mesh(geo, mat);
+        m.position.set(x, y, z);
+        m.castShadow = true;
+        m.userData.originalMat = mat;
+        g.add(m);
+        parts.push(m);
+        return m;
+    };
+    // Beefier proportions. Local origin is at body vertical center.
+    mkPart(new THREE.BoxGeometry(0.55, 1.5, 0.55), bodyMat, -0.35, -1.05, 0);  // left leg
+    mkPart(new THREE.BoxGeometry(0.55, 1.5, 0.55), bodyMat,  0.35, -1.05, 0);  // right leg
+    mkPart(new THREE.BoxGeometry(1.6,  1.4, 0.8),  bodyMat,  0,    0.0,   0);  // torso
+    mkPart(new THREE.BoxGeometry(0.5,  1.4, 0.5),  bodyMat, -1.05, 0.0,   0);  // left arm
+    mkPart(new THREE.BoxGeometry(0.5,  1.4, 0.5),  bodyMat,  1.05, 0.0,   0);  // right arm
+    const head = mkPart(new THREE.BoxGeometry(0.9, 0.8, 0.8), headMat, 0, 1.1, 0);
+
+    // Giant glowing eyes
+    const eyeMat = new THREE.MeshBasicMaterial({ color: 0xffee00 });
+    const eyeL = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.22, 0.05), eyeMat);
+    const eyeR = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.22, 0.05), eyeMat);
+    eyeL.position.set(-0.22, 0.05, -0.42);
+    eyeR.position.set( 0.22, 0.05, -0.42);
+    head.add(eyeL); head.add(eyeR);
+
+    // Spikes on top of the head
+    const spikeMat = new THREE.MeshStandardMaterial({ color: 0x220000 });
+    for (let i = -1; i <= 1; i++) {
+        const spike = new THREE.Mesh(new THREE.ConeGeometry(0.12, 0.5, 6), spikeMat);
+        spike.position.set(i * 0.2, 0.55, 0);
+        head.add(spike);
+    }
+    return { group: g, bodyParts: parts };
+}
 
 // === Damage numbers (floating hit text) ======================
 function spawnDamageNumber(worldPos, amount, isHeadshot) {
@@ -1196,9 +1532,14 @@ function spawnEnemy(overridePos) {
         x = Math.cos(angle) * dist;
         z = Math.sin(angle) * dist;
     }
-    const mesh = new THREE.Mesh(ENEMY_GEO, ENEMY_MAT.clone());
+    // Build a humanoid body (head, torso, arms, legs). Each enemy clones the
+    // shared material so hurt flashes don't flicker the whole group at once.
+    const bodyMat = ENEMY_MAT.clone();
+    const headMat = ENEMY_HEAD_MAT.clone();
+    const { group: mesh, bodyParts } = makeEnemyBody(bodyMat, headMat);
+    // Group origin is at body center; placing mesh.y = 0.9 puts feet at y=0.
     mesh.position.set(x, 0.9, z);
-    mesh.castShadow = true;
+
     const barBg = new THREE.Mesh(
         new THREE.PlaneGeometry(1.0, 0.12),
         new THREE.MeshBasicMaterial({ color: 0x222222, depthTest: false })
@@ -1229,15 +1570,16 @@ function spawnEnemy(overridePos) {
         damage: ENEMY_DMG,
         attackRange: ENEMY_ATTACK_RANGE,
         attackCdMax: ENEMY_ATTACK_CD,
+        bodyParts,
+        bodyMat, headMat,
         mat: ENEMY_MAT, matHurt: ENEMY_MAT_HURT,
         shootCd: 0,
     };
-    // Hitbox ~60% wider and 30% taller than the visual box, centered on the body.
-    const hb = makeHitbox(1.5, 2.4, 1.5, e);
-    hb.position.set(0, 0.3, 0); // shift up slightly so head is inside
+    // Hitbox covers the whole humanoid, generous width for forgiving aim.
+    const hb = makeHitbox(1.5, 2.1, 1.5, e);
+    hb.position.set(0, 0, 0);
     mesh.add(hb);
     e.hitbox = hb;
-    // HP number above the bar
     const hpt = makeHpTextSprite(false);
     hpt.sprite.position.set(0, 1.6, 0);
     mesh.add(hpt.sprite);
@@ -1252,17 +1594,12 @@ function spawnBoss() {
     const dist = 42;
     const x = Math.cos(angle) * dist;
     const z = Math.sin(angle) * dist;
-    const mesh = new THREE.Mesh(BOSS_GEO, BOSS_MAT.clone());
+    const bodyMat = BOSS_MAT.clone();
+    const headMat = BOSS_HEAD_MAT.clone();
+    const { group: mesh, bodyParts } = makeBossBody(bodyMat, headMat);
+    // Group origin is at body vertical center. Feet span local -1.8 to -0.3,
+    // so pos.y = 1.8 puts feet at world y = 0.
     mesh.position.set(x, 1.8, z);
-    mesh.castShadow = true;
-
-    // Glowing eye cubes
-    const eyeMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
-    const eyeL = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.25, 0.1), eyeMat);
-    const eyeR = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.25, 0.1), eyeMat);
-    eyeL.position.set(-0.4, 0.7, -1.25);
-    eyeR.position.set( 0.4, 0.7, -1.25);
-    mesh.add(eyeL); mesh.add(eyeR);
 
     // Boss HP bar (larger, gold)
     const barBg = new THREE.Mesh(
@@ -1297,11 +1634,13 @@ function spawnBoss() {
         damage: 22,
         attackRange: BOSS_ATTACK_RANGE,
         attackCdMax: BOSS_ATTACK_CD,
+        bodyParts,
+        bodyMat, headMat,
         mat: BOSS_MAT, matHurt: BOSS_MAT_HURT,
         shootCd: 2.2,
     };
     // Generous boss hitbox: matches visual closely but slightly padded.
-    const hb = makeHitbox(3.2, 4.2, 3.2, e);
+    const hb = makeHitbox(3.6, 4.0, 3.6, e);
     hb.position.set(0, 0, 0);
     mesh.add(hb);
     e.hitbox = hb;
@@ -1374,11 +1713,17 @@ function updateEnemies(dt) {
             }
         }
 
-        // Hurt flash
+        // Hurt flash: swap every body part to the hurt material briefly, then
+        // restore each part's original material so the head keeps its tint.
         if (e.hurtTimer > 0) {
             e.hurtTimer -= dt;
-            e.mesh.material = e.matHurt;
-            if (e.hurtTimer <= 0) e.mesh.material = e.mat;
+            if (e.bodyParts) {
+                if (e.hurtTimer > 0) {
+                    for (const part of e.bodyParts) part.material = e.matHurt;
+                } else {
+                    for (const part of e.bodyParts) part.material = part.userData.originalMat;
+                }
+            }
         }
 
         // Face HP bar at camera
@@ -1428,7 +1773,13 @@ function killEnemy(e) {
         }
         // Small HP reward too
         game.player.hp = Math.min(MAX_HP, game.player.hp + 25);
-        showMessage('BOSS BESIEGT! +2 Medkit, +Munition', 2500);
+        // Weapon unlock: give the next locked weapon in the order.
+        const unlocked = unlockNextWeapon();
+        if (unlocked) {
+            showUnlockBanner(unlocked);
+        } else {
+            showMessage('BOSS BESIEGT! +2 Medkit, +Munition', 2500);
+        }
     } else {
         game.player.wood += 20;
         // +10 ammo to CURRENT weapon's reserve
@@ -1512,9 +1863,20 @@ function damagePlayer(dmg) {
     }
     p.hp -= dmg;
     p.damageFlashTimer = 0.25;
+    p.lastDamageTime = performance.now();
     document.body.classList.add('damage');
     updateHudCounters();
     if (p.hp <= 0) gameOver();
+}
+
+// Halo-style: shield starts regenerating after 5 seconds of no damage taken.
+function updateShieldRegen(dt) {
+    const p = game.player;
+    if (p.shield >= MAX_SHIELD) return;
+    const since = (performance.now() - p.lastDamageTime) / 1000;
+    if (since < 5) return;
+    p.shield = Math.min(MAX_SHIELD, p.shield + 18 * dt);
+    updateHudCounters();
 }
 
 function updateWaves(dt) {
@@ -1976,8 +2338,60 @@ function cancelEdit() {
 }
 function updateSlotHud() {
     document.querySelectorAll('.slot').forEach(s => {
-        s.classList.toggle('active', parseInt(s.dataset.slot) === game.slot);
+        const idx = parseInt(s.dataset.slot);
+        s.classList.toggle('active', idx === game.slot);
+        // Sync locked state from unlock table
+        if (idx >= 1 && idx <= 6) {
+            const id = WEAPON_ORDER[idx - 1];
+            const locked = !game.player.unlockedWeapons[id];
+            s.classList.toggle('locked', locked);
+            const lockEl = s.querySelector('.slot-lock');
+            if (lockEl) lockEl.style.display = locked ? '' : 'none';
+        }
     });
+}
+
+// Unlock the first locked weapon in WEAPON_ORDER. Returns the weapon id or null.
+function unlockNextWeapon() {
+    for (const id of WEAPON_ORDER) {
+        if (!game.player.unlockedWeapons[id]) {
+            game.player.unlockedWeapons[id] = true;
+            // Give a full clip + reserve boost for the new weapon so the player
+            // can immediately try it.
+            const w = WEAPONS[id];
+            const ammo = game.player.weaponAmmo[id];
+            ammo.clip = w.clip;
+            ammo.reserve = Math.min(w.max, ammo.reserve + w.start);
+            updateSlotHud();
+            return id;
+        }
+    }
+    return null;
+}
+
+function showUnlockBanner(weaponId) {
+    const w = WEAPONS[weaponId];
+    const el = document.getElementById('unlock-banner');
+    if (!el) return;
+    el.innerHTML = '🏆 NEUE WAFFE: ' + w.name.toUpperCase() +
+        '<span class="sub">Slot ' + weaponSlotOf(weaponId) + ' — Mausrad oder Nummerntaste</span>';
+    el.classList.remove('hidden');
+    // Restart the CSS animation by reflowing
+    el.style.animation = 'none';
+    void el.offsetWidth;
+    el.style.animation = '';
+    clearTimeout(showUnlockBanner._t);
+    showUnlockBanner._t = setTimeout(() => el.classList.add('hidden'), 2800);
+}
+
+// Hit marker on the crosshair. Triggered from shoot() when we hit an enemy.
+function flashHitMarker(isHeadshot) {
+    const el = document.getElementById('hitmarker');
+    if (!el) return;
+    el.classList.toggle('headshot', !!isHeadshot);
+    el.classList.add('hit');
+    clearTimeout(flashHitMarker._t);
+    flashHitMarker._t = setTimeout(() => el.classList.remove('hit'), 160);
 }
 function updateModeHud() {
     const el = document.getElementById('mode-indicator');
@@ -2012,6 +2426,9 @@ function restart() {
     // Clear boss projectiles
     for (const pr of game.bossProjectiles) game.scene.remove(pr.mesh);
     game.bossProjectiles = [];
+    // Clear any in-flight rockets
+    for (const r of game.rockets) game.scene.remove(r.mesh);
+    game.rockets = [];
     // Clear particles/bullets
     for (const b of game.bullets) game.scene.remove(b);
     game.bullets = [];
@@ -2035,10 +2452,12 @@ function restart() {
     game.player.medkits = START_MEDKITS;
     game.player.currentWeapon = 'pistol';
     game.player.weaponAmmo = makeInitialWeaponAmmo();
+    game.player.unlockedWeapons = makeInitialUnlocks();
     game.player.reloading = false;
     game.player.reloadTimer = 0;
     game.player.shootCooldown = 0;
     game.player.healCd = 0;
+    game.player.lastDamageTime = 0;
     game.slot = 1;
     game.mode = 'combat';
     game.bossQueue = 0;

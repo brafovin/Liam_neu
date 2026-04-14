@@ -110,6 +110,63 @@ canvas {
     font-weight: normal;
 }
 
+#hitmarker {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%) scale(1);
+    font-size: 22px;
+    color: #ff5544;
+    text-shadow: 0 0 4px #000, 0 0 2px #fff;
+    opacity: 0;
+    transition: opacity 0.18s ease-out;
+    pointer-events: none;
+    font-weight: bold;
+}
+
+#hitmarker.hit {
+    opacity: 1;
+}
+
+#hitmarker.headshot {
+    color: #ffaa00;
+    font-size: 30px;
+}
+
+#unlock-banner {
+    position: absolute;
+    top: 30%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: linear-gradient(135deg, rgba(255, 204, 0, 0.95), rgba(255, 100, 30, 0.95));
+    color: #000;
+    padding: 20px 50px;
+    border-radius: 10px;
+    font-size: 28px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    border: 3px solid #fff;
+    box-shadow: 0 0 40px rgba(255, 170, 0, 0.8);
+    text-align: center;
+    animation: unlockPulse 2.8s ease-out;
+    text-shadow: 0 0 2px #fff;
+}
+
+#unlock-banner .sub {
+    font-size: 16px;
+    display: block;
+    margin-top: 6px;
+    color: #330000;
+}
+
+@keyframes unlockPulse {
+    0%   { transform: translate(-50%, -50%) scale(0.5); opacity: 0; }
+    15%  { transform: translate(-50%, -50%) scale(1.1); opacity: 1; }
+    25%  { transform: translate(-50%, -50%) scale(1); }
+    85%  { opacity: 1; }
+    100% { opacity: 0; }
+}
+
 #top-info {
     position: absolute;
     top: 20px;
@@ -181,12 +238,12 @@ canvas {
     left: 50%;
     transform: translateX(-50%);
     display: flex;
-    gap: 5px;
+    gap: 4px;
 }
 
 .slot {
-    width: 68px;
-    height: 64px;
+    width: 62px;
+    height: 62px;
     background: rgba(0, 0, 0, 0.6);
     border: 2px solid rgba(255, 255, 255, 0.3);
     border-radius: 4px;
@@ -206,6 +263,27 @@ canvas {
     color: #ffcc00;
     font-weight: bold;
     text-shadow: 0 0 2px #000;
+}
+
+.slot.locked {
+    opacity: 0.45;
+    filter: grayscale(0.85);
+}
+
+.slot.locked .slot-icon,
+.slot.locked .slot-name {
+    opacity: 0.6;
+}
+
+.slot-lock {
+    position: absolute;
+    bottom: 2px;
+    right: 4px;
+    font-size: 12px;
+}
+
+.slot-icon {
+    font-size: 26px;
 }
 
 .slot.active {

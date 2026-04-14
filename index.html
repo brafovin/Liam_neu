@@ -21,14 +21,16 @@
                     <div><b>Linksklick</b></div><div>Schießen / Bauen</div>
                     <div><b>Rechtsklick</b></div><div>Zielen</div>
                     <div><b>1</b></div><div>Pistole</div>
-                    <div><b>2</b></div><div>AK47</div>
-                    <div><b>3</b></div><div>Schrotflinte</div>
-                    <div><b>4</b></div><div>Sniper</div>
-                    <div><b>5</b></div><div>Medkit (Heilen)</div>
-                    <div><b>6</b></div><div>Wand bauen</div>
-                    <div><b>7</b></div><div>Boden bauen</div>
-                    <div><b>8</b></div><div>Rampe bauen</div>
-                    <div><b>9</b></div><div>Dach bauen</div>
+                    <div><b>2</b></div><div>SMG</div>
+                    <div><b>3</b></div><div>AK47</div>
+                    <div><b>4</b></div><div>Schrotflinte</div>
+                    <div><b>5</b></div><div>Sniper</div>
+                    <div><b>6</b></div><div>Raketenwerfer</div>
+                    <div><b>7</b></div><div>Medkit (Heilen)</div>
+                    <div><b>8</b></div><div>Wand bauen</div>
+                    <div><b>9</b></div><div>Boden bauen</div>
+                    <div><b>0</b></div><div>Rampe bauen</div>
+                    <div><b>Mausrad</b></div><div>Slot wechseln</div>
                     <div><b>G</b></div><div>Editier-Modus</div>
                     <div><b>R</b></div><div>Nachladen</div>
                     <div><b>N</b></div><div>Neustart</div>
@@ -41,6 +43,8 @@
 
     <div id="hud">
         <div id="crosshair">+</div>
+        <div id="hitmarker">&#10005;</div>
+        <div id="unlock-banner" class="hidden"></div>
 
         <div id="top-info">
             <div id="score">Kills: 0</div>
@@ -67,46 +71,56 @@
                 <div class="slot-icon">🔫</div>
                 <div class="slot-name">Pistole</div>
             </div>
-            <div class="slot" data-slot="2">
+            <div class="slot locked" data-slot="2">
                 <div class="slot-num">2</div>
+                <div class="slot-icon">🔫</div>
+                <div class="slot-name">SMG</div>
+                <div class="slot-lock">🔒</div>
+            </div>
+            <div class="slot locked" data-slot="3">
+                <div class="slot-num">3</div>
                 <div class="slot-icon">🗡️</div>
                 <div class="slot-name">AK47</div>
+                <div class="slot-lock">🔒</div>
             </div>
-            <div class="slot" data-slot="3">
-                <div class="slot-num">3</div>
+            <div class="slot locked" data-slot="4">
+                <div class="slot-num">4</div>
                 <div class="slot-icon">💥</div>
                 <div class="slot-name">Schrot</div>
+                <div class="slot-lock">🔒</div>
             </div>
-            <div class="slot" data-slot="4">
-                <div class="slot-num">4</div>
+            <div class="slot locked" data-slot="5">
+                <div class="slot-num">5</div>
                 <div class="slot-icon">🎯</div>
                 <div class="slot-name">Sniper</div>
+                <div class="slot-lock">🔒</div>
             </div>
-            <div class="slot" data-slot="5">
-                <div class="slot-num">5</div>
+            <div class="slot locked" data-slot="6">
+                <div class="slot-num">6</div>
+                <div class="slot-icon">🚀</div>
+                <div class="slot-name">Rakete</div>
+                <div class="slot-lock">🔒</div>
+            </div>
+            <div class="slot" data-slot="7">
+                <div class="slot-num">7</div>
                 <div class="slot-icon">❤️</div>
                 <div class="slot-name">Medkit</div>
                 <div class="slot-count" id="medkit-count">2</div>
             </div>
-            <div class="slot" data-slot="6">
-                <div class="slot-num">6</div>
+            <div class="slot" data-slot="8">
+                <div class="slot-num">8</div>
                 <div class="slot-icon">🧱</div>
                 <div class="slot-name">Wand</div>
             </div>
-            <div class="slot" data-slot="7">
-                <div class="slot-num">7</div>
+            <div class="slot" data-slot="9">
+                <div class="slot-num">9</div>
                 <div class="slot-icon">⬜</div>
                 <div class="slot-name">Boden</div>
             </div>
-            <div class="slot" data-slot="8">
-                <div class="slot-num">8</div>
+            <div class="slot" data-slot="10">
+                <div class="slot-num">0</div>
                 <div class="slot-icon">📐</div>
                 <div class="slot-name">Rampe</div>
-            </div>
-            <div class="slot" data-slot="9">
-                <div class="slot-num">9</div>
-                <div class="slot-icon">🔺</div>
-                <div class="slot-name">Dach</div>
             </div>
         </div>
 
