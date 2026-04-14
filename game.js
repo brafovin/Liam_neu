@@ -13,15 +13,59 @@ const MOVE_SPEED = 6;
 const SPRINT_MUL = 1.7;
 const MAX_HP = 100;
 const MAX_SHIELD = 50;
-const MAX_AMMO_CLIP = 15;
-const MAX_AMMO_RESERVE = 200;
-const START_AMMO_RESERVE = 60;
 const AMMO_PER_KILL = 10;
 const BUILD_HP = 200;
 const BUILD_COST = 10;
 const ENEMY_HP_BASE = 40;
 const ENEMY_DMG = 8;
 const ENEMY_SPEED = 2.8;
+const HEAL_AMOUNT = 40;
+const MAX_MEDKITS = 9;
+const START_MEDKITS = 2;
+const RELOAD_TIME = 1.5;
+const SHOTGUN_RELOAD = 1.8;
+const SNIPER_RELOAD = 2.0;
+
+// === WEAPONS ==================================================
+// id → stats. dmg=per-pellet damage, cd=time between shots, clip=magazine size,
+// start=starting reserve, max=max reserve, spread=random cone radians,
+// pellets=raycasts per shot (shotgun), range=max ray, auto=full-auto flag,
+// reload=reload time seconds, tracerColor=tracer line color.
+const WEAPONS = {
+    pistol: {
+        id: 'pistol', name: 'Pistole', icon: '🔫',
+        dmg: 22, cd: 0.18, clip: 15, start: 60, max: 200,
+        spread: 0.015, pellets: 1, range: 200, auto: false,
+        reload: RELOAD_TIME, tracerColor: 0xffff66,
+    },
+    ak: {
+        id: 'ak', name: 'AK47', icon: '🗡️',
+        dmg: 18, cd: 0.09, clip: 30, start: 90, max: 300,
+        spread: 0.045, pellets: 1, range: 180, auto: true,
+        reload: 2.0, tracerColor: 0xff9933,
+    },
+    shotgun: {
+        id: 'shotgun', name: 'Schrotflinte', icon: '💥',
+        dmg: 14, cd: 0.9, clip: 6, start: 18, max: 60,
+        spread: 0.18, pellets: 8, range: 35, auto: false,
+        reload: SHOTGUN_RELOAD, tracerColor: 0xffaa44,
+    },
+    sniper: {
+        id: 'sniper', name: 'Sniper', icon: '🎯',
+        dmg: 150, cd: 1.5, clip: 3, start: 9, max: 30,
+        spread: 0.0, pellets: 1, range: 400, auto: false,
+        reload: SNIPER_RELOAD, tracerColor: 0x66ffcc,
+    },
+};
+const WEAPON_ORDER = ['pistol', 'ak', 'shotgun', 'sniper'];
+
+function makeInitialWeaponAmmo() {
+    const out = {};
+    for (const id of WEAPON_ORDER) {
+        out[id] = { clip: WEAPONS[id].clip, reserve: WEAPONS[id].start };
+    }
+    return out;
+}
 
 const game = {
     scene: null, camera: null, renderer: null, clock: null,
@@ -32,9 +76,12 @@ const game = {
         onGround: false,
         hp: MAX_HP, shield: MAX_SHIELD,
         wood: 500, kills: 0, wave: 1,
-        ammoClip: MAX_AMMO_CLIP, ammoReserve: START_AMMO_RESERVE,
+        medkits: START_MEDKITS,
+        currentWeapon: 'pistol',
+        weaponAmmo: makeInitialWeaponAmmo(),
         reloading: false, reloadTimer: 0,
         shootCooldown: 0,
+        healCd: 0,
         damageFlashTimer: 0,
     },
     keys: {},
@@ -42,11 +89,13 @@ const game = {
     locked: false,
     paused: true,
     running: false,
-    slot: 1, // 1=gun, 2=wall, 3=floor, 4=ramp, 5=roof
-    mode: 'combat', // 'combat' | 'build' | 'edit'
+    slot: 1, // 1=pistol 2=ak 3=shotgun 4=sniper 5=medkit 6=wall 7=floor 8=ramp 9=roof
+    mode: 'combat', // 'combat' | 'heal' | 'build' | 'edit'
     builds: [],       // placed structures
     enemies: [],
+    bossQueue: 0,
     bullets: [],      // visual tracers
+    bossProjectiles: [],
     particles: [],
     preview: null,    // ghost preview mesh
     editing: null,    // struct being edited
@@ -187,6 +236,10 @@ function setupInput() {
         else if (e.code === 'Digit3') selectSlot(3);
         else if (e.code === 'Digit4') selectSlot(4);
         else if (e.code === 'Digit5') selectSlot(5);
+        else if (e.code === 'Digit6') selectSlot(6);
+        else if (e.code === 'Digit7') selectSlot(7);
+        else if (e.code === 'Digit8') selectSlot(8);
+        else if (e.code === 'Digit9') selectSlot(9);
         else if (e.code === 'KeyR') startReload();
         else if (e.code === 'KeyG') toggleEditMode();
     });
@@ -212,11 +265,23 @@ function setupInput() {
 
 function selectSlot(n) {
     game.slot = n;
-    game.mode = (n === 1) ? 'combat' : 'build';
+    if (n >= 1 && n <= 4) {
+        game.mode = 'combat';
+        game.player.currentWeapon = WEAPON_ORDER[n - 1];
+        // Cancel an in-progress reload from a different weapon
+        game.player.reloading = false;
+        game.player.reloadTimer = 0;
+        game.player.shootCooldown = 0.05; // tiny delay to avoid instant swap-fire
+    } else if (n === 5) {
+        game.mode = 'heal';
+    } else if (n >= 6 && n <= 9) {
+        game.mode = 'build';
+    }
     if (game.editing) cancelEdit();
     updateSlotHud();
     updateModeHud();
     updatePreview();
+    updateHudCounters();
 }
 
 // === 4. COLLISION ============================================
@@ -372,6 +437,7 @@ function loop() {
         updateBullets(dt);
         updateParticles(dt);
         updateEnemies(dt);
+        updateBossProjectiles(dt);
         updateWaves(dt);
         updateWeapon(dt);
         updateDamageFlash(dt);
@@ -413,7 +479,7 @@ function makeBuildMesh(type, damaged) {
 }
 
 function slotType() {
-    return ['wall','floor','ramp','roof'][game.slot - 2] || 'wall';
+    return ['wall','floor','ramp','roof'][game.slot - 6] || 'wall';
 }
 
 function snap(v) { return Math.round(v / GRID) * GRID; }
@@ -577,60 +643,57 @@ function updateAutoBuild(dt) {
 
 // === Stubs (filled by later sections) =======================
 // === 9. WEAPON / SHOOTING ====================================
-const BULLET_DMG = 22;
-const SHOOT_CD = 0.18;
-const RELOAD_TIME = 1.5;
-
 function shoot() {
     const p = game.player;
     if (p.shootCooldown > 0) return;
     if (p.reloading) return;
-    if (p.ammoClip <= 0) {
-        // Auto-reload on empty click instead of nagging the player.
-        startReload();
-        return;
-    }
-    p.ammoClip--;
-    p.shootCooldown = SHOOT_CD;
+    const w = WEAPONS[p.currentWeapon];
+    const ammo = p.weaponAmmo[p.currentWeapon];
+    if (!w || !ammo) return;
+    if (ammo.clip <= 0) { startReload(); return; }
 
-    // If the last bullet just left the clip, start reloading automatically.
-    if (p.ammoClip === 0 && p.ammoReserve > 0) startReload();
+    ammo.clip--;
+    p.shootCooldown = w.cd;
+    if (ammo.clip === 0 && ammo.reserve > 0) startReload();
 
-    // Raycast from camera forward
-    const origin = p.pos.clone();
-    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(game.camera.quaternion).normalize();
-    game.raycaster.set(origin, dir);
-    game.raycaster.far = 200;
-
-    // Collect candidate objects: enemies + builds (recursive for groups)
+    // Collect candidate targets once; reused per pellet.
     const targets = [];
     for (const e of game.enemies) targets.push(e.mesh);
     for (const b of game.builds) targets.push(b.mesh);
-    const hits = game.raycaster.intersectObjects(targets, true);
 
-    let endPoint;
-    if (hits.length) {
-        const hit = hits[0];
-        endPoint = hit.point.clone();
-        // find owning enemy or build
-        let owner = hit.object;
-        while (owner) {
-            const e = game.enemies.find(en => en.mesh === owner);
-            if (e) { damageEnemy(e, BULLET_DMG); break; }
-            const b = game.builds.find(bu => bu.mesh === owner);
-            if (b) { damageBuild(b, BULLET_DMG); break; }
-            owner = owner.parent;
+    const origin = p.pos.clone();
+    const baseDir = new THREE.Vector3(0, 0, -1).applyQuaternion(game.camera.quaternion).normalize();
+
+    for (let i = 0; i < w.pellets; i++) {
+        const dir = baseDir.clone();
+        if (w.spread > 0) {
+            dir.x += (Math.random() - 0.5) * 2 * w.spread;
+            dir.y += (Math.random() - 0.5) * 2 * w.spread;
+            dir.z += (Math.random() - 0.5) * 2 * w.spread;
+            dir.normalize();
         }
-        spawnImpact(endPoint);
-    } else {
-        endPoint = origin.clone().add(dir.clone().multiplyScalar(200));
+        game.raycaster.set(origin, dir);
+        game.raycaster.far = w.range;
+        const hits = game.raycaster.intersectObjects(targets, true);
+
+        let endPoint;
+        if (hits.length) {
+            endPoint = hits[0].point.clone();
+            let owner = hits[0].object;
+            while (owner) {
+                const e = game.enemies.find(en => en.mesh === owner);
+                if (e) { damageEnemy(e, w.dmg); break; }
+                const bb = game.builds.find(bu => bu.mesh === owner);
+                if (bb) { damageBuild(bb, w.dmg); break; }
+                owner = owner.parent;
+            }
+            spawnImpact(endPoint);
+        } else {
+            endPoint = origin.clone().add(dir.clone().multiplyScalar(w.range));
+        }
+        spawnTracer(origin.clone().add(dir.clone().multiplyScalar(0.6)), endPoint, w.tracerColor);
     }
-
-    // Tracer line
-    spawnTracer(origin.clone().add(dir.clone().multiplyScalar(0.6)), endPoint);
-    // Muzzle flash: brief point light
-    spawnMuzzleFlash(origin, dir);
-
+    spawnMuzzleFlash(origin, baseDir);
     updateHudCounters();
 }
 
@@ -648,40 +711,65 @@ function destroyBuild(b) {
 function startReload() {
     const p = game.player;
     if (p.reloading) return;
-    if (p.ammoClip >= MAX_AMMO_CLIP) return;
-    if (p.ammoReserve <= 0) { showMessage('Keine Munition!'); return; }
+    const w = WEAPONS[p.currentWeapon];
+    const ammo = p.weaponAmmo[p.currentWeapon];
+    if (!w || !ammo) return;
+    if (ammo.clip >= w.clip) return;
+    if (ammo.reserve <= 0) { showMessage('Keine Munition!'); return; }
     p.reloading = true;
-    p.reloadTimer = RELOAD_TIME;
-    showMessage('Nachladen...', RELOAD_TIME * 1000);
+    p.reloadTimer = w.reload;
+    showMessage('Nachladen...', w.reload * 1000);
 }
 
 function updateWeapon(dt) {
     const p = game.player;
     if (p.shootCooldown > 0) p.shootCooldown -= dt;
+    if (p.healCd > 0) p.healCd -= dt;
+
     if (p.reloading) {
         p.reloadTimer -= dt;
         if (p.reloadTimer <= 0) {
-            const need = MAX_AMMO_CLIP - p.ammoClip;
-            const take = Math.min(need, p.ammoReserve);
-            p.ammoClip += take;
-            p.ammoReserve -= take;
+            const w = WEAPONS[p.currentWeapon];
+            const ammo = p.weaponAmmo[p.currentWeapon];
+            if (w && ammo) {
+                const need = w.clip - ammo.clip;
+                const take = Math.min(need, ammo.reserve);
+                ammo.clip += take;
+                ammo.reserve -= take;
+            }
             p.reloading = false;
             updateHudCounters();
         }
     }
-    // auto fire while holding if combat
-    if (game.mouse.down && game.mode === 'combat' && !p.reloading && p.shootCooldown <= 0 && p.ammoClip > 0) {
-        // (semi-auto feels better with pistol; keep single-click only)
+
+    // Full-auto fire while holding LMB on auto weapons (AK)
+    const w = WEAPONS[p.currentWeapon];
+    if (w && w.auto && game.mouse.down && game.mode === 'combat'
+        && !p.reloading && p.shootCooldown <= 0) {
+        shoot();
     }
 }
 
-function spawnTracer(from, to) {
+function spawnTracer(from, to, color = 0xffff66) {
     const geo = new THREE.BufferGeometry().setFromPoints([from, to]);
-    const mat = new THREE.LineBasicMaterial({ color: 0xffff66, transparent: true, opacity: 0.9 });
+    const mat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.9 });
     const line = new THREE.Line(geo, mat);
     line.userData.life = 0.08;
     game.scene.add(line);
     game.bullets.push(line);
+}
+
+function useMedkit() {
+    const p = game.player;
+    if (p.healCd > 0) return;
+    if (p.medkits <= 0) { showMessage('Kein Medkit!', 800); return; }
+    if (p.hp >= MAX_HP) { showMessage('HP voll', 600); return; }
+    p.medkits--;
+    const healed = Math.min(HEAL_AMOUNT, MAX_HP - p.hp);
+    p.hp += healed;
+    p.healCd = 0.6;
+    showMessage('+' + healed + ' HP', 800);
+    updateHudCounters();
 }
 
 function spawnMuzzleFlash(origin, dir) {
@@ -738,7 +826,7 @@ function updateParticles(dt) {
         }
     }
 }
-// === 10. ENEMIES & WAVES =====================================
+// === 10. ENEMIES, BOSSES & WAVES =============================
 const ENEMY_GEO = new THREE.BoxGeometry(0.9, 1.8, 0.9);
 const ENEMY_MAT = new THREE.MeshStandardMaterial({ color: 0xc03030 });
 const ENEMY_MAT_HURT = new THREE.MeshStandardMaterial({ color: 0xff8888 });
@@ -746,6 +834,16 @@ const ENEMY_RADIUS = 0.55;
 const ENEMY_ATTACK_RANGE = 1.5;
 const ENEMY_ATTACK_CD = 1.0;
 const WAVE_PAUSE = 3.5;
+const BOSS_GEO = new THREE.BoxGeometry(2.4, 3.6, 2.4);
+const BOSS_MAT = new THREE.MeshStandardMaterial({
+    color: 0x550011, emissive: 0x330000, emissiveIntensity: 0.6, metalness: 0.4, roughness: 0.6,
+});
+const BOSS_MAT_HURT = new THREE.MeshStandardMaterial({
+    color: 0xff3344, emissive: 0x660000, emissiveIntensity: 0.8,
+});
+const BOSS_RADIUS = 1.3;
+const BOSS_ATTACK_RANGE = 2.5;
+const BOSS_ATTACK_CD = 1.4;
 
 function spawnEnemy() {
     const angle = Math.random() * Math.PI * 2;
@@ -755,7 +853,6 @@ function spawnEnemy() {
     const mesh = new THREE.Mesh(ENEMY_GEO, ENEMY_MAT.clone());
     mesh.position.set(x, 0.9, z);
     mesh.castShadow = true;
-    // HP bar (sprite-like plane facing camera)
     const barBg = new THREE.Mesh(
         new THREE.PlaneGeometry(1.0, 0.12),
         new THREE.MeshBasicMaterial({ color: 0x222222, depthTest: false })
@@ -773,30 +870,94 @@ function spawnEnemy() {
     game.scene.add(mesh);
     const hpMax = ENEMY_HP_BASE + (game.player.wave - 1) * 10;
     const e = {
+        isBoss: false,
         mesh, bar, barBg,
         pos: mesh.position,
+        meshYOffset: 0.9,
         hp: hpMax, hpMax,
         attackCd: 0,
         hurtTimer: 0,
+        radius: ENEMY_RADIUS,
+        speed: ENEMY_SPEED,
+        damage: ENEMY_DMG,
+        attackRange: ENEMY_ATTACK_RANGE,
+        attackCdMax: ENEMY_ATTACK_CD,
+        mat: ENEMY_MAT, matHurt: ENEMY_MAT_HURT,
+        shootCd: 0,
     };
     game.enemies.push(e);
 }
 
+function spawnBoss() {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = 42;
+    const x = Math.cos(angle) * dist;
+    const z = Math.sin(angle) * dist;
+    const mesh = new THREE.Mesh(BOSS_GEO, BOSS_MAT.clone());
+    mesh.position.set(x, 1.8, z);
+    mesh.castShadow = true;
+
+    // Glowing eye cubes
+    const eyeMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+    const eyeL = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.25, 0.1), eyeMat);
+    const eyeR = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.25, 0.1), eyeMat);
+    eyeL.position.set(-0.4, 0.7, -1.25);
+    eyeR.position.set( 0.4, 0.7, -1.25);
+    mesh.add(eyeL); mesh.add(eyeR);
+
+    // Boss HP bar (larger, gold)
+    const barBg = new THREE.Mesh(
+        new THREE.PlaneGeometry(3.2, 0.28),
+        new THREE.MeshBasicMaterial({ color: 0x111111, depthTest: false })
+    );
+    barBg.position.set(0, 2.4, 0);
+    barBg.renderOrder = 10;
+    mesh.add(barBg);
+    const bar = new THREE.Mesh(
+        new THREE.PlaneGeometry(3.05, 0.2),
+        new THREE.MeshBasicMaterial({ color: 0xffcc00, depthTest: false })
+    );
+    bar.position.set(0, 2.4, 0.01);
+    bar.renderOrder = 11;
+    mesh.add(bar);
+
+    game.scene.add(mesh);
+    const bossTier = Math.max(1, Math.floor(game.player.wave / 5));
+    const hpMax = 350 + bossTier * 200;
+    const e = {
+        isBoss: true,
+        mesh, bar, barBg,
+        pos: mesh.position,
+        meshYOffset: 1.8,
+        hp: hpMax, hpMax,
+        attackCd: 0,
+        hurtTimer: 0,
+        radius: BOSS_RADIUS,
+        speed: 2.2,
+        damage: 22,
+        attackRange: BOSS_ATTACK_RANGE,
+        attackCdMax: BOSS_ATTACK_CD,
+        mat: BOSS_MAT, matHurt: BOSS_MAT_HURT,
+        shootCd: 2.2,
+    };
+    game.enemies.push(e);
+    showMessage('BOSS ERSCHEINT!', 2500);
+}
+
 function enemyBox(e) {
     return new THREE.Box3(
-        new THREE.Vector3(e.pos.x - ENEMY_RADIUS, 0, e.pos.z - ENEMY_RADIUS),
-        new THREE.Vector3(e.pos.x + ENEMY_RADIUS, 1.8, e.pos.z + ENEMY_RADIUS)
+        new THREE.Vector3(e.pos.x - e.radius, 0, e.pos.z - e.radius),
+        new THREE.Vector3(e.pos.x + e.radius, e.meshYOffset * 2, e.pos.z + e.radius)
     );
 }
 
 function moveEnemyWithCollision(e, delta) {
-    const next = e.pos.clone().add(delta);
     const oldX = e.pos.x, oldZ = e.pos.z;
-    e.pos.x = next.x;
+    e.pos.x += delta.x;
     if (enemyBlocked(e)) e.pos.x = oldX;
-    e.pos.z = next.z;
+    e.pos.z += delta.z;
     if (enemyBlocked(e)) e.pos.z = oldZ;
-    e.mesh.position.set(e.pos.x, 0.9, e.pos.z);
+    e.mesh.position.set(e.pos.x, e.meshYOffset, e.pos.z);
 }
 
 function enemyBlocked(e) {
@@ -814,63 +975,150 @@ function enemyBlocked(e) {
 function updateEnemies(dt) {
     for (let i = game.enemies.length - 1; i >= 0; i--) {
         const e = game.enemies[i];
-        // Move toward player
         const toPlayer = new THREE.Vector3(
-            game.player.pos.x - e.pos.x,
-            0,
-            game.player.pos.z - e.pos.z
+            game.player.pos.x - e.pos.x, 0, game.player.pos.z - e.pos.z
         );
         const distXZ = toPlayer.length();
         if (distXZ > 0.01) toPlayer.multiplyScalar(1 / distXZ);
-        // Face player
         e.mesh.rotation.y = Math.atan2(toPlayer.x, toPlayer.z);
 
-        if (distXZ > ENEMY_ATTACK_RANGE - 0.2) {
-            const step = toPlayer.multiplyScalar(ENEMY_SPEED * dt);
+        if (distXZ > e.attackRange - 0.2) {
+            const step = toPlayer.multiplyScalar(e.speed * dt);
             moveEnemyWithCollision(e, step);
         }
 
-        // Attack
+        // Melee attack
         if (e.attackCd > 0) e.attackCd -= dt;
-        const dReal = Math.hypot(
-            game.player.pos.x - e.pos.x,
-            game.player.pos.z - e.pos.z
-        );
-        if (dReal <= ENEMY_ATTACK_RANGE && e.attackCd <= 0) {
-            e.attackCd = ENEMY_ATTACK_CD;
-            damagePlayer(ENEMY_DMG);
+        if (distXZ <= e.attackRange && e.attackCd <= 0) {
+            e.attackCd = e.attackCdMax;
+            damagePlayer(e.damage);
+        }
+
+        // Boss ranged attack: fire a projectile at the player from mid range
+        if (e.isBoss) {
+            e.shootCd -= dt;
+            if (e.shootCd <= 0 && distXZ > 3 && distXZ < 35) {
+                spawnBossProjectile(e, game.player.pos);
+                e.shootCd = 2.5;
+            }
         }
 
         // Hurt flash
         if (e.hurtTimer > 0) {
             e.hurtTimer -= dt;
-            e.mesh.material = ENEMY_MAT_HURT;
-            if (e.hurtTimer <= 0) e.mesh.material = ENEMY_MAT;
+            e.mesh.material = e.matHurt;
+            if (e.hurtTimer <= 0) e.mesh.material = e.mat;
         }
 
         // Face HP bar at camera
         e.bar.lookAt(game.camera.position);
         e.barBg.lookAt(game.camera.position);
-        e.bar.scale.x = Math.max(0, e.hp / e.hpMax);
-        e.bar.position.x = -(1 - e.bar.scale.x) * 0.48;
+        const pct = Math.max(0, e.hp / e.hpMax);
+        e.bar.scale.x = pct;
+        const barFullWidth = e.isBoss ? 3.05 : 0.96;
+        e.bar.position.x = -(1 - pct) * (barFullWidth / 2);
     }
 }
 
 function damageEnemy(e, dmg) {
+    if (e.dead) return;
     e.hp -= dmg;
     e.hurtTimer = 0.1;
     if (e.hp <= 0) killEnemy(e);
 }
 
 function killEnemy(e) {
+    if (e.dead) return;
+    e.dead = true;
     game.scene.remove(e.mesh);
     const i = game.enemies.indexOf(e);
     if (i >= 0) game.enemies.splice(i, 1);
     game.player.kills++;
-    // Drops: wood + ammo
-    game.player.wood += 20;
-    game.player.ammoReserve = Math.min(MAX_AMMO_RESERVE, game.player.ammoReserve + AMMO_PER_KILL);
+
+    if (e.isBoss) {
+        // Boss loot: heals, ammo for every weapon, wood
+        game.player.wood += 200;
+        game.player.medkits = Math.min(MAX_MEDKITS, game.player.medkits + 2);
+        for (const id of WEAPON_ORDER) {
+            const w = WEAPONS[id];
+            const ammo = game.player.weaponAmmo[id];
+            ammo.reserve = Math.min(w.max, ammo.reserve + Math.floor(w.clip * 2));
+        }
+        // Small HP reward too
+        game.player.hp = Math.min(MAX_HP, game.player.hp + 25);
+        showMessage('BOSS BESIEGT! +2 Medkit, +Munition', 2500);
+    } else {
+        game.player.wood += 20;
+        // +10 ammo to CURRENT weapon's reserve
+        const w = WEAPONS[game.player.currentWeapon];
+        const ammo = game.player.weaponAmmo[game.player.currentWeapon];
+        if (w && ammo) ammo.reserve = Math.min(w.max, ammo.reserve + AMMO_PER_KILL);
+    }
     updateHudCounters();
+}
+
+// ----- Boss projectile ----------------------------------------
+function spawnBossProjectile(boss, targetPos) {
+    const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.45, 12, 12),
+        new THREE.MeshBasicMaterial({ color: 0xff3300 })
+    );
+    const from = boss.pos.clone(); from.y = 1.5;
+    mesh.position.copy(from);
+    const light = new THREE.PointLight(0xff5522, 3.0, 10);
+    mesh.add(light);
+    game.scene.add(mesh);
+
+    const to = targetPos.clone();
+    const dir = to.sub(from).normalize();
+    game.bossProjectiles.push({
+        mesh,
+        pos: mesh.position,
+        dir,
+        speed: 20,
+        life: 2.5,
+        dmg: 18,
+    });
+}
+
+function updateBossProjectiles(dt) {
+    for (let i = game.bossProjectiles.length - 1; i >= 0; i--) {
+        const pr = game.bossProjectiles[i];
+        pr.life -= dt;
+        const step = pr.dir.clone().multiplyScalar(pr.speed * dt);
+        pr.pos.add(step);
+
+        // Hit player?
+        const dx = pr.pos.x - game.player.pos.x;
+        const dy = pr.pos.y - (game.player.pos.y - PLAYER_HEIGHT / 2);
+        const dz = pr.pos.z - game.player.pos.z;
+        if (dx*dx + dy*dy + dz*dz < 1.0) {
+            damagePlayer(pr.dmg);
+            spawnImpact(pr.pos.clone());
+            game.scene.remove(pr.mesh);
+            game.bossProjectiles.splice(i, 1);
+            continue;
+        }
+
+        // Hit a wall / build?
+        const pbox = new THREE.Box3(
+            new THREE.Vector3(pr.pos.x - 0.3, pr.pos.y - 0.3, pr.pos.z - 0.3),
+            new THREE.Vector3(pr.pos.x + 0.3, pr.pos.y + 0.3, pr.pos.z + 0.3)
+        );
+        let hitBuild = false;
+        for (const b of game.builds) {
+            if (!b.box.intersectsBox(pbox)) continue;
+            if (b.tileBoxes && b.tileBoxes.length) {
+                for (const tb of b.tileBoxes) if (tb.intersectsBox(pbox)) { hitBuild = true; break; }
+            } else hitBuild = true;
+            if (hitBuild) break;
+        }
+        if (hitBuild || pr.life <= 0) {
+            spawnImpact(pr.pos.clone());
+            game.scene.remove(pr.mesh);
+            game.bossProjectiles.splice(i, 1);
+        }
+    }
 }
 
 function damagePlayer(dmg) {
@@ -888,13 +1136,18 @@ function damagePlayer(dmg) {
 }
 
 function updateWaves(dt) {
-    // spawn queued enemies gradually
-    if (game.spawnQueue > 0) {
+    if (game.bossQueue > 0 || game.spawnQueue > 0) {
         game.waveTimer -= dt;
         if (game.waveTimer <= 0) {
-            spawnEnemy();
-            game.spawnQueue--;
-            game.waveTimer = 0.6;
+            if (game.bossQueue > 0) {
+                spawnBoss();
+                game.bossQueue--;
+                game.waveTimer = 1.2;
+            } else {
+                spawnEnemy();
+                game.spawnQueue--;
+                game.waveTimer = 0.6;
+            }
             updateHudCounters();
         }
     } else if (game.enemies.length === 0) {
@@ -902,9 +1155,16 @@ function updateWaves(dt) {
         game.waveTimer -= dt;
         if (game.waveTimer <= -WAVE_PAUSE) {
             game.player.wave++;
-            game.spawnQueue = 3 + game.player.wave * 2;
+            if (game.player.wave % 5 === 0) {
+                // Boss wave: fewer grunts, one scaling boss
+                game.spawnQueue = 2 + Math.floor(game.player.wave / 5);
+                game.bossQueue = 1 + Math.floor(game.player.wave / 10); // wave 10: 2 bosses, wave 20: 3, ...
+                showMessage('⚠ BOSS-WELLE ' + game.player.wave + ' ⚠', 2500);
+            } else {
+                game.spawnQueue = 3 + game.player.wave * 2;
+                showMessage('Welle ' + game.player.wave, 1500);
+            }
             game.waveTimer = 0.4;
-            showMessage('Welle ' + game.player.wave, 1500);
             updateHudCounters();
         }
     }
@@ -913,6 +1173,7 @@ function updateWaves(dt) {
 function startWaves() {
     game.player.wave = 1;
     game.spawnQueue = 5;
+    game.bossQueue = 0;
     game.waveTimer = 1.0;
     showMessage('Welle 1', 1500);
 }
@@ -924,7 +1185,6 @@ function updateDamageFlash(dt) {
 }
 function handleClick() {
     if (game.mode === 'build') {
-        // Immediate placement on click; updateAutoBuild handles continuous hold.
         if (game.buildCooldown <= 0) {
             if (placeBuild()) game.buildCooldown = 0.12;
             else game.buildCooldown = 0.08;
@@ -932,6 +1192,7 @@ function handleClick() {
         return;
     }
     if (game.mode === 'edit') { editClick(); return; }
+    if (game.mode === 'heal') { useMedkit(); return; }
     if (game.mode === 'combat') { shoot(); return; }
 }
 
@@ -944,17 +1205,24 @@ function showMessage(text, ms = 1500) {
 }
 
 function updateHudCounters() {
-    document.getElementById('wood-count').textContent = game.player.wood;
-    document.getElementById('score').textContent = 'Kills: ' + game.player.kills;
-    document.getElementById('wave').textContent = 'Welle: ' + game.player.wave;
-    document.getElementById('enemies-left').textContent = 'Gegner: ' + (game.enemies.length + game.spawnQueue);
-    const hpPct = Math.max(0, game.player.hp) / MAX_HP * 100;
-    const shPct = Math.max(0, game.player.shield) / MAX_SHIELD * 100;
+    const p = game.player;
+    document.getElementById('wood-count').textContent = p.wood;
+    document.getElementById('score').textContent = 'Kills: ' + p.kills;
+    document.getElementById('wave').textContent = 'Welle: ' + p.wave;
+    document.getElementById('enemies-left').textContent =
+        'Gegner: ' + (game.enemies.length + game.spawnQueue + game.bossQueue);
+    const hpPct = Math.max(0, p.hp) / MAX_HP * 100;
+    const shPct = Math.max(0, p.shield) / MAX_SHIELD * 100;
     document.getElementById('health-bar').style.width = hpPct + '%';
     document.getElementById('shield-bar').style.width = shPct + '%';
-    document.getElementById('health-text').textContent = Math.max(0, Math.round(game.player.hp));
-    document.getElementById('shield-text').textContent = Math.max(0, Math.round(game.player.shield));
-    document.getElementById('ammo-text').textContent = game.player.ammoClip + ' / ' + game.player.ammoReserve;
+    document.getElementById('health-text').textContent = Math.max(0, Math.round(p.hp));
+    document.getElementById('shield-text').textContent = Math.max(0, Math.round(p.shield));
+    const ammo = p.weaponAmmo[p.currentWeapon];
+    if (ammo) {
+        document.getElementById('ammo-text').textContent = ammo.clip + ' / ' + ammo.reserve;
+    }
+    const mk = document.getElementById('medkit-count');
+    if (mk) mk.textContent = p.medkits;
 }
 // === 8. EDIT SYSTEM ==========================================
 // Classic Fortnite-style: look at your own structure, press G → 3×3 overlay.
@@ -1132,9 +1400,14 @@ function updateSlotHud() {
 function updateModeHud() {
     const el = document.getElementById('mode-indicator');
     el.className = '';
-    if (game.mode === 'combat') { el.textContent = 'KAMPF'; el.classList.add('combat'); }
+    if (game.mode === 'combat') {
+        const w = WEAPONS[game.player.currentWeapon];
+        el.textContent = w ? w.name.toUpperCase() : 'KAMPF';
+        el.classList.add('combat');
+    }
+    else if (game.mode === 'heal')  { el.textContent = 'HEILEN';    el.classList.add('heal'); }
     else if (game.mode === 'build') { el.textContent = 'BAU-MODUS'; el.classList.add('build'); }
-    else if (game.mode === 'edit') { el.textContent = 'EDIT-MODUS'; el.classList.add('edit'); }
+    else if (game.mode === 'edit')  { el.textContent = 'EDIT-MODUS'; el.classList.add('edit'); }
 }
 
 // === 11. GAME OVER / RESTART =================================
@@ -1154,6 +1427,9 @@ function restart() {
     // Clear enemies
     for (const e of game.enemies) game.scene.remove(e.mesh);
     game.enemies = [];
+    // Clear boss projectiles
+    for (const pr of game.bossProjectiles) game.scene.remove(pr.mesh);
+    game.bossProjectiles = [];
     // Clear particles/bullets
     for (const b of game.bullets) game.scene.remove(b);
     game.bullets = [];
@@ -1167,12 +1443,19 @@ function restart() {
     game.player.wood = 500;
     game.player.kills = 0;
     game.player.wave = 1;
-    game.player.ammoClip = MAX_AMMO_CLIP;
-    game.player.ammoReserve = START_AMMO_RESERVE;
+    game.player.medkits = START_MEDKITS;
+    game.player.currentWeapon = 'pistol';
+    game.player.weaponAmmo = makeInitialWeaponAmmo();
     game.player.reloading = false;
+    game.player.reloadTimer = 0;
     game.player.shootCooldown = 0;
+    game.player.healCd = 0;
     game.slot = 1;
     game.mode = 'combat';
+    game.bossQueue = 0;
+    game.spawnQueue = 0;
+    game.mouse.down = false;
+    game.mouse.rightDown = false;
     if (game.editing) cancelEdit();
     updateSlotHud();
     updateModeHud();
