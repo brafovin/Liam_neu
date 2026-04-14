@@ -340,7 +340,8 @@ canvas {
     color: #ffcc00;
 }
 
-#restart-btn {
+#restart-btn,
+#blocker-restart-btn {
     padding: 16px 40px;
     font-size: 24px;
     background: linear-gradient(90deg, #ffcc00, #ff6600);
@@ -353,8 +354,15 @@ canvas {
     transition: transform 0.2s;
 }
 
-#restart-btn:hover {
+#restart-btn:hover,
+#blocker-restart-btn:hover {
     transform: scale(1.1);
+}
+
+#blocker-restart-btn {
+    margin-top: 24px;
+    padding: 12px 32px;
+    font-size: 20px;
 }
 
 /* Damage indicator overlay */

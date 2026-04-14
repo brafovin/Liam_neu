@@ -179,6 +179,8 @@ function setupInput() {
 
     document.addEventListener('keydown', (e) => {
         game.keys[e.code] = true;
+        // N works in any state (gameplay, pause, game-over) so the player can always restart.
+        if (e.code === 'KeyN') { restart(); return; }
         if (!game.locked) return;
         if (e.code === 'Digit1') selectSlot(1);
         else if (e.code === 'Digit2') selectSlot(2);
@@ -1099,7 +1101,9 @@ function restart() {
     document.getElementById('game-over').classList.add('hidden');
     document.body.classList.remove('damage');
     game.running = true;
-    game.paused = true; // resumes on pointer lock
+    // If pointer is still locked (mid-game restart via N key) continue playing immediately.
+    // Otherwise (restart from game-over / pause screen) wait for user to click the blocker.
+    game.paused = !game.locked;
     startWaves();
 }
 
@@ -1114,6 +1118,12 @@ function init() {
     updateHudCounters();
 
     document.getElementById('restart-btn').addEventListener('click', restart);
+    const blockerRestart = document.getElementById('blocker-restart-btn');
+    blockerRestart.addEventListener('click', (ev) => {
+        // Prevent the blocker's "click to lock pointer" handler from firing.
+        ev.stopPropagation();
+        restart();
+    });
 
     if (!('requestPointerLock' in document.body)) {
         showMessage('Browser unterstützt Pointer Lock nicht', 4000);
