@@ -14,7 +14,9 @@ const SPRINT_MUL = 1.7;
 const MAX_HP = 100;
 const MAX_SHIELD = 50;
 const MAX_AMMO_CLIP = 15;
-const MAX_AMMO_RESERVE = 60;
+const MAX_AMMO_RESERVE = 200;
+const START_AMMO_RESERVE = 60;
+const AMMO_PER_KILL = 10;
 const BUILD_HP = 200;
 const BUILD_COST = 10;
 const ENEMY_HP_BASE = 40;
@@ -30,7 +32,7 @@ const game = {
         onGround: false,
         hp: MAX_HP, shield: MAX_SHIELD,
         wood: 500, kills: 0, wave: 1,
-        ammoClip: MAX_AMMO_CLIP, ammoReserve: MAX_AMMO_RESERVE,
+        ammoClip: MAX_AMMO_CLIP, ammoReserve: START_AMMO_RESERVE,
         reloading: false, reloadTimer: 0,
         shootCooldown: 0,
         damageFlashTimer: 0,
@@ -57,7 +59,10 @@ const game = {
     tmpV2: new THREE.Vector3(),
     tmpE: new THREE.Euler(0, 0, 0, 'YXZ'),
     worldBoxes: [],   // AABBs for collision (rebuilt when builds change)
+    worldMeshes: [],  // Meshes for raycast targeting (trees, rocks)
+    groundMesh: null,
     sunLight: null,
+    buildCooldown: 0, // auto-build rate limiter
 };
 
 // === 2. SCENE SETUP ==========================================
@@ -99,6 +104,7 @@ function setupScene() {
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
     game.scene.add(ground);
+    game.groundMesh = ground;
 
     // Grid helper (subtle)
     const grid = new THREE.GridHelper(400, 100, 0x000000, 0x225522);
@@ -128,6 +134,7 @@ function setupScene() {
             leaves.castShadow = true;
             game.scene.add(leaves);
             game.worldBoxes.push(new THREE.Box3().setFromObject(trunk));
+            game.worldMeshes.push(trunk, leaves);
         } else {
             // rock
             const r = 0.6 + Math.random() * 1.2;
@@ -140,6 +147,7 @@ function setupScene() {
             rock.receiveShadow = true;
             game.scene.add(rock);
             game.worldBoxes.push(new THREE.Box3().setFromObject(rock));
+            game.worldMeshes.push(rock);
         }
     }
 }
@@ -286,6 +294,7 @@ function loop() {
     if (!game.paused && game.running) {
         updatePlayer(dt);
         updatePreview();
+        updateAutoBuild(dt);
         updateBullets(dt);
         updateParticles(dt);
         updateEnemies(dt);
@@ -336,42 +345,76 @@ function slotType() {
 function snap(v) { return Math.round(v / GRID) * GRID; }
 
 function buildTargetPos(type) {
-    // Cast from camera forward to get a point within 5m
-    const p = game.player.pos;
-    const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(game.camera.quaternion);
-    const target = p.clone().add(fwd.multiplyScalar(5));
-    const gx = snap(target.x);
-    const gz = snap(target.z);
+    // Raycast from camera forward to find what the crosshair is pointing at.
+    const origin = game.player.pos.clone();
+    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(game.camera.quaternion).normalize();
+    game.raycaster.set(origin, dir);
+    game.raycaster.far = 15;
 
-    // Y snapping
-    let gy;
-    if (type === 'floor') {
-        // Floor tiles live at integer grid levels (top-of-floor at k*GRID)
-        const k = Math.round(target.y / GRID);
-        gy = k * GRID - 0.125; // small thickness
-    } else if (type === 'wall') {
-        // Wall spans [k*GRID, k*GRID + GRID] — center at k*GRID + GRID/2
-        const k = Math.floor(target.y / GRID);
-        gy = k * GRID + GRID / 2;
-    } else if (type === 'ramp') {
-        // Ramp spans [k*GRID, k*GRID+GRID] so the mesh center is k*GRID + GRID/2
-        const k = Math.floor(target.y / GRID);
-        gy = k * GRID + GRID / 2;
-    } else /* roof */ {
-        const k = Math.round(target.y / GRID) + 1;
-        gy = k * GRID - 0.25;
+    const targets = [];
+    if (game.groundMesh) targets.push(game.groundMesh);
+    for (const b of game.builds) targets.push(b.mesh);
+    for (const w of game.worldMeshes) targets.push(w);
+    const hits = game.raycaster.intersectObjects(targets, true);
+
+    // Fallback when nothing hit: project 7m forward at head height
+    let hp;
+    if (hits.length) {
+        hp = hits[0].point.clone();
+        // Nudge slightly along ray direction so we land "in" the surface (helps wall edge detection)
+        hp.add(dir.clone().multiplyScalar(0.01));
+    } else {
+        hp = origin.clone().add(dir.clone().multiplyScalar(7));
     }
 
-    // Wall / ramp face nearest cardinal yaw
-    let rotY = Math.round(game.player.yaw / (Math.PI / 2)) * (Math.PI / 2);
-    return { x: gx, y: gy, z: gz, rotY };
+    // Cell that the hit point falls into
+    const cellX = Math.round(hp.x / GRID) * GRID;
+    const cellZ = Math.round(hp.z / GRID) * GRID;
+
+    if (type === 'floor') {
+        const k = Math.round(hp.y / GRID);
+        return { x: cellX, y: k * GRID - 0.125, z: cellZ, rotY: 0 };
+    }
+
+    if (type === 'wall') {
+        // Pick the nearest edge of the cell the user is looking at so walls snap
+        // exactly to grid lines like in Fortnite.
+        const k = Math.floor(hp.y / GRID);
+        const wy = k * GRID + GRID / 2;
+        const dx = hp.x - cellX;
+        const dz = hp.z - cellZ;
+        if (Math.abs(dx) >= Math.abs(dz)) {
+            const sign = dx >= 0 ? 1 : -1;
+            return { x: cellX + sign * GRID / 2, y: wy, z: cellZ, rotY: Math.PI / 2 };
+        } else {
+            const sign = dz >= 0 ? 1 : -1;
+            return { x: cellX, y: wy, z: cellZ + sign * GRID / 2, rotY: 0 };
+        }
+    }
+
+    if (type === 'ramp') {
+        const k = Math.floor(hp.y / GRID);
+        // Ramp faces the direction the player is looking (nearest cardinal)
+        const rotY = Math.round(game.player.yaw / (Math.PI / 2)) * (Math.PI / 2);
+        return { x: cellX, y: k * GRID + GRID / 2, z: cellZ, rotY };
+    }
+
+    // roof
+    const k = Math.round(hp.y / GRID) + 1;
+    return { x: cellX, y: k * GRID - 0.25, z: cellZ, rotY: 0 };
 }
 
 function structureBox(type, x, y, z, rotY) {
     // Slight shrink so adjacent grid-aligned pieces don't register as overlapping.
     const EPS = 0.02;
     let hx, hy, hz;
-    if (type === 'wall')       { hx = GRID/2 - EPS; hy = GRID/2 - EPS; hz = 0.13; }
+    if (type === 'wall') {
+        // Use a bigger epsilon on the LENGTH axis so two perpendicular walls meeting at a
+        // shared grid corner don't mutually block each other.
+        hx = GRID / 2 - 0.18;
+        hy = GRID / 2 - EPS;
+        hz = 0.11;
+    }
     else if (type === 'floor') { hx = GRID/2 - EPS; hy = 0.13;          hz = GRID/2 - EPS; }
     else if (type === 'ramp')  { hx = GRID/2 - EPS; hy = GRID/2 - EPS;  hz = GRID/2 - EPS; }
     else                        { hx = GRID/2 - EPS; hy = 0.25;          hz = GRID/2 - EPS; }
@@ -424,8 +467,8 @@ function updatePreview() {
 function placeBuild() {
     const type = slotType();
     const t = buildTargetPos(type);
-    if (!canPlace(type, t.x, t.y, t.z, t.rotY)) return;
-    if (game.player.wood < BUILD_COST) { showMessage('Zu wenig Holz!'); return; }
+    if (!canPlace(type, t.x, t.y, t.z, t.rotY)) return false;
+    if (game.player.wood < BUILD_COST) { showMessage('Zu wenig Holz!'); return false; }
     game.player.wood -= BUILD_COST;
     const mesh = makeBuildMesh(type);
     mesh.position.set(t.x, t.y, t.z);
@@ -439,6 +482,20 @@ function placeBuild() {
     };
     game.builds.push(struct);
     updateHudCounters();
+    return true;
+}
+
+function updateAutoBuild(dt) {
+    if (game.buildCooldown > 0) game.buildCooldown -= dt;
+    if (game.mode !== 'build') return;
+    if (!game.mouse.down) return;
+    if (game.buildCooldown > 0) return;
+    if (placeBuild()) {
+        game.buildCooldown = 0.12; // ~8 placements / sec while holding
+    } else {
+        // Placement blocked (overlap / out of wood): slow retry so we don't spam canPlace
+        game.buildCooldown = 0.08;
+    }
 }
 
 // === Stubs (filled by later sections) =======================
@@ -729,8 +786,9 @@ function killEnemy(e) {
     const i = game.enemies.indexOf(e);
     if (i >= 0) game.enemies.splice(i, 1);
     game.player.kills++;
-    // drop a bit of wood
+    // Drops: wood + ammo
     game.player.wood += 20;
+    game.player.ammoReserve = Math.min(MAX_AMMO_RESERVE, game.player.ammoReserve + AMMO_PER_KILL);
     updateHudCounters();
 }
 
@@ -784,7 +842,14 @@ function updateDamageFlash(dt) {
     }
 }
 function handleClick() {
-    if (game.mode === 'build') { placeBuild(); return; }
+    if (game.mode === 'build') {
+        // Immediate placement on click; updateAutoBuild handles continuous hold.
+        if (game.buildCooldown <= 0) {
+            if (placeBuild()) game.buildCooldown = 0.12;
+            else game.buildCooldown = 0.08;
+        }
+        return;
+    }
     if (game.mode === 'edit') { editClick(); return; }
     if (game.mode === 'combat') { shoot(); return; }
 }
@@ -1022,7 +1087,7 @@ function restart() {
     game.player.kills = 0;
     game.player.wave = 1;
     game.player.ammoClip = MAX_AMMO_CLIP;
-    game.player.ammoReserve = MAX_AMMO_RESERVE;
+    game.player.ammoReserve = START_AMMO_RESERVE;
     game.player.reloading = false;
     game.player.shootCooldown = 0;
     game.slot = 1;
