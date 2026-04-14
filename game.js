@@ -23,6 +23,9 @@ const HEAL_AMOUNT = 40;
 const MAX_MEDKITS = 9;
 const START_MEDKITS = 2;
 const RELOAD_TIME = 1.5;
+const HEADSHOT_MULT_ENEMY = 2.5;
+const HEADSHOT_MULT_BOSS = 2.0;
+const HEADSHOT_MULT_DUMMY = 2.5;
 const SHOTGUN_RELOAD = 1.8;
 const SNIPER_RELOAD = 2.0;
 
@@ -117,6 +120,7 @@ const game = {
     dummies: [],
     viewmodelHolder: null,
     viewmodelRecoil: 0,
+    damageNumbers: [],
 };
 
 // === 2. SCENE SETUP ==========================================
@@ -446,6 +450,7 @@ function loop() {
         updateAutoBuild(dt);
         updateBullets(dt);
         updateParticles(dt);
+        updateDamageNumbers(dt);
         if (game.state === 'lobby') {
             updateLobby(dt);
         } else if (game.state === 'playing') {
@@ -672,7 +677,6 @@ function shoot() {
 
     // Collect candidate targets. Enemies are represented by their invisible
     // HITBOX child mesh (bigger than the visual) so aiming is forgiving.
-    // Dummies use their main mesh (they need to be visible AND hittable).
     const targets = [];
     for (const e of game.enemies) if (e.hitbox) targets.push(e.hitbox);
     for (const d of game.dummies) targets.push(d.hitbox);
@@ -680,6 +684,9 @@ function shoot() {
 
     const origin = p.pos.clone();
     const baseDir = new THREE.Vector3(0, 0, -1).applyQuaternion(game.camera.quaternion).normalize();
+
+    // Accumulate damage per target so shotgun pellets show one combined number.
+    const shotSummary = new Map(); // target → { amount, pos, head }
 
     for (let i = 0; i < w.pellets; i++) {
         const dir = baseDir.clone();
@@ -698,9 +705,21 @@ function shoot() {
             endPoint = hits[0].point.clone();
             const obj = hits[0].object;
             if (obj.userData && obj.userData.isHitbox && obj.userData.enemy) {
-                damageEnemy(obj.userData.enemy, w.dmg);
+                const e = obj.userData.enemy;
+                // Headshot: hit point's Y is above a threshold relative to mesh center.
+                const headThreshold = e.isBoss ? 0.9 : 0.4;
+                const headshot = (endPoint.y - e.pos.y) > headThreshold;
+                const mult = headshot ? (e.isBoss ? HEADSHOT_MULT_BOSS : HEADSHOT_MULT_ENEMY) : 1;
+                const dealt = w.dmg * mult;
+                damageEnemy(e, dealt);
+                accumulateDamage(shotSummary, e, dealt, endPoint, headshot);
             } else if (obj.userData && obj.userData.isDummy) {
-                damageDummy(obj.userData.dummy, w.dmg);
+                const d = obj.userData.dummy;
+                const headshot = (endPoint.y - d.mesh.position.y) > 0.4;
+                const mult = headshot ? HEADSHOT_MULT_DUMMY : 1;
+                const dealt = w.dmg * mult;
+                damageDummy(d, dealt);
+                accumulateDamage(shotSummary, d, dealt, endPoint, headshot);
             } else {
                 // Must be a build (or child of a build group)
                 let owner = obj;
@@ -715,6 +734,11 @@ function shoot() {
             endPoint = origin.clone().add(dir.clone().multiplyScalar(w.range));
         }
         spawnTracer(origin.clone().add(dir.clone().multiplyScalar(0.6)), endPoint, w.tracerColor);
+    }
+
+    // Emit one damage number per target this shot (combined).
+    for (const info of shotSummary.values()) {
+        spawnDamageNumber(info.pos, info.amount, info.head);
     }
     spawnMuzzleFlash(origin, baseDir);
     game.viewmodelRecoil = Math.min(0.15, game.viewmodelRecoil + 0.08);
@@ -1037,6 +1061,90 @@ const BOSS_RADIUS = 1.3;
 const BOSS_ATTACK_RANGE = 2.5;
 const BOSS_ATTACK_CD = 1.4;
 
+// === Damage numbers (floating hit text) ======================
+function spawnDamageNumber(worldPos, amount, isHeadshot) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256; canvas.height = 96;
+    const ctx = canvas.getContext('2d');
+    const text = Math.round(amount).toString();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = '#000';
+    ctx.font = isHeadshot ? 'bold 68px Arial' : 'bold 54px Arial';
+    ctx.fillStyle = isHeadshot ? '#ff3366' : '#ffe055';
+    ctx.strokeText(text, 128, 48);
+    ctx.fillText(text, 128, 48);
+    if (isHeadshot) {
+        ctx.font = 'bold 22px Arial';
+        ctx.lineWidth = 5;
+        ctx.fillStyle = '#ff6688';
+        ctx.strokeText('HEADSHOT!', 128, 86);
+        ctx.fillText('HEADSHOT!', 128, 86);
+    }
+    const tex = new THREE.CanvasTexture(canvas);
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+    const sprite = new THREE.Sprite(mat);
+    sprite.renderOrder = 50;
+    // Small random offset so overlapping numbers don't perfectly stack.
+    sprite.position.set(
+        worldPos.x + (Math.random() - 0.5) * 0.4,
+        worldPos.y + 0.2,
+        worldPos.z + (Math.random() - 0.5) * 0.4
+    );
+    const scale = isHeadshot ? 1.6 : 1.2;
+    sprite.scale.set(scale, scale * 0.4, 1);
+    game.scene.add(sprite);
+    game.damageNumbers.push({
+        sprite, tex, life: 1.1, velY: 1.8, isHead: isHeadshot,
+    });
+}
+
+function updateDamageNumbers(dt) {
+    for (let i = game.damageNumbers.length - 1; i >= 0; i--) {
+        const dn = game.damageNumbers[i];
+        dn.life -= dt;
+        dn.sprite.position.y += dn.velY * dt;
+        dn.velY = Math.max(0, dn.velY - dt * 0.5);
+        dn.sprite.material.opacity = Math.max(0, dn.life / 1.1);
+        if (dn.life <= 0) {
+            game.scene.remove(dn.sprite);
+            if (dn.tex) dn.tex.dispose();
+            if (dn.sprite.material) dn.sprite.material.dispose();
+            game.damageNumbers.splice(i, 1);
+        }
+    }
+}
+
+// === Enemy HP text sprite ====================================
+function makeHpTextSprite(isBoss) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256; canvas.height = 64;
+    const tex = new THREE.CanvasTexture(canvas);
+    const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+    const sprite = new THREE.Sprite(mat);
+    sprite.renderOrder = 13;
+    const s = isBoss ? 2.4 : 1.2;
+    sprite.scale.set(s, s * 0.25, 1);
+    return { sprite, canvas, tex };
+}
+
+function updateHpText(hpt, hp, hpMax, isBoss) {
+    const ctx = hpt.canvas.getContext('2d');
+    ctx.clearRect(0, 0, hpt.canvas.width, hpt.canvas.height);
+    ctx.font = isBoss ? 'bold 36px Arial' : 'bold 30px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = '#000';
+    ctx.fillStyle = '#ffffff';
+    const shown = Math.max(0, Math.round(hp));
+    const text = shown + ' / ' + Math.round(hpMax);
+    ctx.strokeText(text, 128, 32);
+    ctx.fillText(text, 128, 32);
+    hpt.tex.needsUpdate = true;
+}
+
 // Generous hitbox — bigger than the visual mesh so aiming is more forgiving.
 // Uses an invisible material so shots still raycast-hit it but it doesn't render.
 function makeHitbox(width, height, depth, enemyRef) {
@@ -1099,6 +1207,12 @@ function spawnEnemy(overridePos) {
     hb.position.set(0, 0.3, 0); // shift up slightly so head is inside
     mesh.add(hb);
     e.hitbox = hb;
+    // HP number above the bar
+    const hpt = makeHpTextSprite(false);
+    hpt.sprite.position.set(0, 1.6, 0);
+    mesh.add(hpt.sprite);
+    e.hpTextData = hpt;
+    updateHpText(hpt, e.hp, e.hpMax, false);
     game.enemies.push(e);
     return e;
 }
@@ -1161,6 +1275,12 @@ function spawnBoss() {
     hb.position.set(0, 0, 0);
     mesh.add(hb);
     e.hitbox = hb;
+    // Boss HP number above the gold bar
+    const hpt = makeHpTextSprite(true);
+    hpt.sprite.position.set(0, 2.85, 0);
+    mesh.add(hpt.sprite);
+    e.hpTextData = hpt;
+    updateHpText(hpt, e.hp, e.hpMax, true);
     game.enemies.push(e);
     showMessage('BOSS ERSCHEINT!', 2500);
 }
@@ -1241,10 +1361,21 @@ function updateEnemies(dt) {
     }
 }
 
+function accumulateDamage(map, target, amount, pos, head) {
+    const existing = map.get(target);
+    if (existing) {
+        existing.amount += amount;
+        if (head) existing.head = true;
+    } else {
+        map.set(target, { amount, pos: pos.clone(), head });
+    }
+}
+
 function damageEnemy(e, dmg) {
     if (e.dead) return;
     e.hp -= dmg;
     e.hurtTimer = 0.1;
+    if (e.hpTextData) updateHpText(e.hpTextData, e.hp, e.hpMax, e.isBoss);
     if (e.hp <= 0) killEnemy(e);
 }
 
@@ -1451,6 +1582,12 @@ function spawnDummy(x, z) {
     hb.position.set(0, 0.3, 0);
     mesh.add(hb);
     d.hitbox = hb;
+    // HP number above the bar
+    const hpt = makeHpTextSprite(false);
+    hpt.sprite.position.set(0, 1.6, 0);
+    mesh.add(hpt.sprite);
+    d.hpTextData = hpt;
+    updateHpText(hpt, DUMMY_HP, DUMMY_HP, false);
     game.scene.add(mesh);
     game.dummies.push(d);
     return d;
@@ -1460,6 +1597,7 @@ function damageDummy(d, dmg) {
     if (d.dead) return;
     d.hp -= dmg;
     d.hurtTimer = 0.1;
+    if (d.hpTextData) updateHpText(d.hpTextData, d.hp, DUMMY_HP, false);
     if (d.hp <= 0) {
         d.dead = true;
         d.mesh.visible = false;
@@ -1477,6 +1615,7 @@ function updateDummies(dt) {
                 d.mesh.visible = true;
                 d.bar.scale.x = 1;
                 d.bar.position.x = 0;
+                if (d.hpTextData) updateHpText(d.hpTextData, d.hp, DUMMY_HP, false);
             }
             continue;
         }
@@ -1822,6 +1961,13 @@ function restart() {
     game.bullets = [];
     for (const p of game.particles) game.scene.remove(p.obj);
     game.particles = [];
+    // Clear floating damage numbers
+    for (const dn of game.damageNumbers) {
+        game.scene.remove(dn.sprite);
+        if (dn.tex) dn.tex.dispose();
+        if (dn.sprite.material) dn.sprite.material.dispose();
+    }
+    game.damageNumbers = [];
     // Reset player
     game.player.pos.set(0, PLAYER_HEIGHT, 0);
     game.player.vel.set(0, 0, 0);
