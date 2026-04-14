@@ -226,11 +226,15 @@ function playerAABB(pos) {
         new THREE.Vector3(pos.x + PLAYER_RADIUS, pos.y + 0.2, pos.z + PLAYER_RADIUS)
     );
 }
+const STEP_HEIGHT = 1.3; // player can step up this much in one frame (onto ramps)
+
+// Collision against everything EXCEPT ramps. Ramps are handled via a surface-ride
+// so the player can walk up them instead of being blocked like a wall.
 function collidesAt(pos) {
     const box = playerAABB(pos);
     for (const b of game.builds) {
+        if (b.type === 'ramp') continue;
         if (!b.box.intersectsBox(box)) continue;
-        // If this build has per-tile boxes (after an edit), only block if at least one tile overlaps.
         if (b.tileBoxes && b.tileBoxes.length) {
             let hit = false;
             for (const tb of b.tileBoxes) if (tb.intersectsBox(box)) { hit = true; break; }
@@ -245,13 +249,72 @@ function collidesAt(pos) {
     return false;
 }
 
+// Returns the world Y of the ramp SURFACE at (worldX, worldZ), or null if
+// outside any ramp's footprint. Transforms to the ramp's local frame and uses
+// the slope formula: local surface y = local x (see makeBuildMesh shape).
+function rampSurfaceY(rs, worldX, worldZ) {
+    const dx = worldX - rs.x;
+    const dz = worldZ - rs.z;
+    const c = Math.cos(rs.rotY);
+    const s = Math.sin(rs.rotY);
+    // Inverse of three.js Y-rotation: local = M^-1 * world
+    const lx =  c * dx - s * dz;
+    const lz =  s * dx + c * dz;
+    const HALF = GRID / 2 - 0.02;
+    if (lx < -HALF || lx > HALF) return null;
+    if (lz < -HALF || lz > HALF) return null;
+    // Local slope: at lx=-HALF world y = rs.y - GRID/2 (base), at lx=+HALF y = rs.y + GRID/2 (top)
+    return rs.y + lx;
+}
+
+// Find the highest ramp surface the player could stand on at (x, z), considering
+// only ramps where the player is near enough to actually be "on" the slope.
+function getRampStandingY(x, z, feetY) {
+    let best = null;
+    for (const b of game.builds) {
+        if (b.type !== 'ramp') continue;
+        const sy = rampSurfaceY(b, x, z);
+        if (sy === null) continue;
+        // Ignore ramps where the player is clearly above and already in the air.
+        if (feetY > sy + 0.5) continue;
+        if (best === null || sy > best) best = sy;
+    }
+    return best;
+}
+
 // === 5. PLAYER UPDATE ========================================
+// Try to move one axis. If blocked by a wall: fail. If stepping onto a ramp
+// would lift the player less than STEP_HEIGHT, allow the move and snap Y up.
+function tryAxisMove(p, axis, delta) {
+    const test = p.pos.clone();
+    test[axis] += delta;
+
+    if (collidesAt(test)) return false;
+
+    const feetY = test.y - PLAYER_HEIGHT;
+    const rampY = getRampStandingY(test.x, test.z, feetY);
+    if (rampY !== null) {
+        const lift = rampY - feetY;
+        if (lift > STEP_HEIGHT) return false;       // ramp surface too high — treat as wall
+        if (lift > 0) {
+            test.y = rampY + PLAYER_HEIGHT;
+            // Re-check that lifted position isn't inside a wall above the ramp.
+            if (collidesAt(test)) return false;
+            p.vel.y = 0;
+            p.onGround = true;
+        }
+    }
+
+    p.pos.copy(test);
+    return true;
+}
+
 function updatePlayer(dt) {
     const p = game.player;
 
     // desired horizontal velocity
     const forward = new THREE.Vector3(-Math.sin(p.yaw), 0, -Math.cos(p.yaw));
-    const right = new THREE.Vector3(Math.cos(p.yaw), 0, -Math.sin(p.yaw));
+    const right   = new THREE.Vector3( Math.cos(p.yaw), 0, -Math.sin(p.yaw));
     let mx = 0, mz = 0;
     if (game.keys['KeyW']) mz += 1;
     if (game.keys['KeyS']) mz -= 1;
@@ -267,21 +330,30 @@ function updatePlayer(dt) {
     p.vel.y -= GRAVITY * dt;
     if (p.onGround && game.keys['Space']) { p.vel.y = JUMP_V; p.onGround = false; }
 
-    // axis-separated move + collide
+    // Horizontal move with axis separation + ramp step-up.
+    if (!tryAxisMove(p, 'x', p.vel.x * dt)) p.vel.x = 0;
+    if (!tryAxisMove(p, 'z', p.vel.z * dt)) p.vel.z = 0;
+
+    // Vertical move
     const next = p.pos.clone();
-    next.x += p.vel.x * dt;
-    if (collidesAt(next)) { next.x = p.pos.x; p.vel.x = 0; }
-    next.z += p.vel.z * dt;
-    if (collidesAt(next)) { next.z = p.pos.z; p.vel.z = 0; }
     next.y += p.vel.y * dt;
     if (next.y < PLAYER_HEIGHT) { next.y = PLAYER_HEIGHT; p.vel.y = 0; p.onGround = true; }
     else p.onGround = false;
     if (collidesAt(next)) {
-        // hit ceiling or standing on build
-        if (p.vel.y > 0) { next.y = p.pos.y; p.vel.y = 0; }
-        else { next.y = p.pos.y; p.vel.y = 0; p.onGround = true; }
+        if (p.vel.y > 0) { next.y = p.pos.y; p.vel.y = 0; }              // ceiling
+        else             { next.y = p.pos.y; p.vel.y = 0; p.onGround = true; } // floor/wall top
     }
     p.pos.copy(next);
+
+    // Ride the ramp surface: if the player is at/below a ramp surface at their
+    // XZ position, snap up so they can walk smoothly along the slope.
+    const feetY = p.pos.y - PLAYER_HEIGHT;
+    const rampY = getRampStandingY(p.pos.x, p.pos.z, feetY);
+    if (rampY !== null && feetY <= rampY + 0.05) {
+        p.pos.y = rampY + PLAYER_HEIGHT;
+        if (p.vel.y < 0) p.vel.y = 0;
+        p.onGround = true;
+    }
 
     // camera
     game.camera.position.copy(p.pos);
@@ -396,8 +468,11 @@ function buildTargetPos(type) {
 
     if (type === 'ramp') {
         const k = Math.floor(hp.y / GRID);
-        // Ramp faces the direction the player is looking (nearest cardinal)
-        const rotY = Math.round(game.player.yaw / (Math.PI / 2)) * (Math.PI / 2);
+        // The ramp's local +X axis climbs the slope. We want that to map to the
+        // player's forward direction in world, so walking forward goes UP the ramp.
+        // Math: world forward = (-sin y, 0, -cos y); three.js local +X → world
+        // (cos r, 0, -sin r). Equating gives r = yaw + π/2.
+        const rotY = Math.round((game.player.yaw + Math.PI / 2) / (Math.PI / 2)) * (Math.PI / 2);
         return { x: cellX, y: k * GRID + GRID / 2, z: cellZ, rotY };
     }
 
@@ -511,11 +586,15 @@ function shoot() {
     if (p.shootCooldown > 0) return;
     if (p.reloading) return;
     if (p.ammoClip <= 0) {
-        showMessage('Leer! R zum Nachladen', 800);
+        // Auto-reload on empty click instead of nagging the player.
+        startReload();
         return;
     }
     p.ammoClip--;
     p.shootCooldown = SHOOT_CD;
+
+    // If the last bullet just left the clip, start reloading automatically.
+    if (p.ammoClip === 0 && p.ammoReserve > 0) startReload();
 
     // Raycast from camera forward
     const origin = p.pos.clone();
